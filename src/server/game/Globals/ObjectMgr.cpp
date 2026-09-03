@@ -4875,6 +4875,15 @@ void ObjectMgr::LoadPlayerInfo()
                 if (sWorld->getIntConfig(CONFIG_EXPANSION) < EXPANSION_WRATH_OF_THE_LICH_KING && class_ == CLASS_DEATH_KNIGHT)
                     continue;
 
+                // Low progression brackets disable Death Knight creation before
+                // level 55. The world database intentionally has no DK stats
+                // below 55, so do not require startup stats for the disabled
+                // heroic class. Re-enable the normal validation when its class
+                // mask is removed at the appropriate progression bracket.
+                if (class_ == CLASS_DEATH_KNIGHT &&
+                    (sWorld->getIntConfig(CONFIG_CHARACTER_CREATING_DISABLED_CLASSMASK) & (1 << (CLASS_DEATH_KNIGHT - 1))))
+                    continue;
+
                 // fatal error if no initial stats data
                 if (!info->levelInfo || (info->levelInfo[sWorld->getIntConfig(CONFIG_START_PLAYER_LEVEL) - 1].stats[0] == 0 && class_ != CLASS_DEATH_KNIGHT) || (info->levelInfo[sWorld->getIntConfig(CONFIG_START_HEROIC_PLAYER_LEVEL) - 1].stats[0] == 0 && class_ == CLASS_DEATH_KNIGHT))
                 {

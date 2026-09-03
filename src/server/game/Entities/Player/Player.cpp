@@ -2435,8 +2435,26 @@ void Player::GiveXP(uint32 xp, Unit* victim, float group_rate, bool isLFGReward)
         if (GetSession()->IsTrialAccount())
             maxLevel = std::min(maxLevel, trialLevelCap);
 
-    if (level >= maxLevel)
+    uint8 progressionLevelCeiling = uint8(std::min(maxLevel, uint32(MAX_LEVEL)));
+    sScriptMgr->OnPlayerGetProgressionLevelCeiling(this, progressionLevelCeiling);
+    maxLevel = std::min(maxLevel, uint32(progressionLevelCeiling));
+
+    if (!sScriptMgr->OnPlayerCanProgress(this))
+    {
+        if (level >= maxLevel && GetUInt32Value(PLAYER_XP) != 0)
+            SetUInt32Value(PLAYER_XP, 0);
         return;
+    }
+
+    if (level >= maxLevel)
+    {
+        // A phase cap is a hard frontier, not a place to accumulate progress
+        // toward the next phase. Clear stale persisted XP at the effective cap,
+        // including trial-account caps below the realm maximum.
+        if (GetUInt32Value(PLAYER_XP) != 0)
+            SetUInt32Value(PLAYER_XP, 0);
+        return;
+    }
 
     if (HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME))
         xp = std::max(1u, xp / 2);
@@ -2469,6 +2487,12 @@ void Player::GiveXP(uint32 xp, Unit* victim, float group_rate, bool isLFGReward)
             GiveLevel(level + 1);
 
         level = GetLevel();
+        if (level >= maxLevel)
+        {
+            newXP = 0;
+            break;
+        }
+
         nextLvlXP = GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
     }
 
@@ -2481,6 +2505,16 @@ void Player::GiveLevel(uint8 level)
 {
     uint8 oldLevel = GetLevel();
     if (level == oldLevel)
+        return;
+
+    uint32 configuredLevelCeiling = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
+    if (uint32 trialLevelCap = sWorld->getIntConfig(CONFIG_TRIAL_LEVEL_CAP))
+        if (GetSession()->IsTrialAccount())
+            configuredLevelCeiling = std::min(configuredLevelCeiling, trialLevelCap);
+
+    uint8 progressionLevelCeiling = uint8(std::min<uint32>(configuredLevelCeiling, MAX_LEVEL));
+    sScriptMgr->OnPlayerGetProgressionLevelCeiling(this, progressionLevelCeiling);
+    if (level > progressionLevelCeiling || !sScriptMgr->OnPlayerCanProgress(this))
         return;
 
     if (!sScriptMgr->OnPlayerCanGiveLevel(this, level))
@@ -3411,6 +3445,9 @@ bool Player::IsNeedCastPassiveSpellAtLearn(SpellInfo const* spellInfo) const
 
 void Player::learnSpell(uint32 spellId, bool temporary /*= false*/, bool learnFromSkill /*= false*/)
 {
+    if (!temporary && !isBeingLoaded() && !sScriptMgr->OnPlayerCanLearnProgressionSpell(this, spellId))
+        return;
+
     // Xinef: don't allow to learn active spell once more
     if (HasActiveSpell(spellId))
     {
@@ -5494,6 +5531,9 @@ void Player::ModifySkillBonus(uint32 skillid, int32 val, bool talent)
 // To "remove" a skill line, set it's values to zero
 void Player::SetSkill(uint16 id, uint16 step, uint16 newVal, uint16 maxVal)
 {
+    if (!sScriptMgr->OnPlayerCanSetProgressionSkill(this, id, newVal, maxVal, step))
+        return;
+
     if (!id)
         return;
 

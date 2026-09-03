@@ -142,6 +142,24 @@ void ScriptMgr::OnPlayerGiveXP(Player* player, uint32& amount, Unit* victim, uin
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_GIVE_EXP, script->OnPlayerGiveXP(player, amount, victim, xpSource));
 }
 
+void ScriptMgr::OnPlayerGetProgressionLevelCeiling(Player* player, uint8& ceiling)
+{
+    if (ScriptRegistry<PlayerScript>::EnabledHooks[PLAYERHOOK_GET_PROGRESSION_LEVEL_CEILING].empty())
+        return;
+
+    for (PlayerScript* script : ScriptRegistry<PlayerScript>::EnabledHooks[PLAYERHOOK_GET_PROGRESSION_LEVEL_CEILING])
+    {
+        uint8 scriptCeiling = ceiling;
+        script->OnPlayerGetProgressionLevelCeiling(player, scriptCeiling);
+        ceiling = std::min(ceiling, scriptCeiling);
+    }
+}
+
+bool ScriptMgr::OnPlayerCanProgress(Player* player)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_PROGRESS, !script->OnPlayerCanProgress(player));
+}
+
 bool ScriptMgr::OnPlayerReputationChange(Player* player, uint32 factionID, int32& standing, bool incremental)
 {
     CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_ON_REPUTATION_CHANGE, !script->OnPlayerReputationChange(player, factionID, standing, incremental));
@@ -160,6 +178,11 @@ void ScriptMgr::OnPlayerGiveReputation(Player* player, int32 factionID, float& a
 void ScriptMgr::OnPlayerLearnSpell(Player* player, uint32 spellID)
 {
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_LEARN_SPELL, script->OnPlayerLearnSpell(player, spellID));
+}
+
+bool ScriptMgr::OnPlayerCanLearnProgressionSpell(Player* player, uint32 spellID)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_LEARN_PROGRESSION_SPELL, !script->OnPlayerCanLearnProgressionSpell(player, spellID));
 }
 
 void ScriptMgr::OnPlayerForgotSpell(Player* player, uint32 spellID)
@@ -217,10 +240,16 @@ void ScriptMgr::OnPlayerUpdate(Player* player, uint32 p_time)
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_UPDATE, script->OnPlayerUpdate(player, p_time));
 }
 
-
 void ScriptMgr::OnPlayerLogin(Player* player)
 {
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_LOGIN, script->OnPlayerLogin(player));
+}
+
+bool ScriptMgr::OnPlayerCanLoadFromDB(ObjectGuid guid, std::string const& name, uint8 race, uint8 classId,
+    uint8 level, uint32 mapId, float x, float y, float z, AccountTypes security, bool isBot)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_LOAD_FROM_DB,
+        !script->OnPlayerCanLoadFromDB(guid, name, race, classId, level, mapId, x, y, z, security, isBot));
 }
 
 void ScriptMgr::OnPlayerLoadFromDB(Player* player)
@@ -383,6 +412,11 @@ void ScriptMgr::OnPlayerStoreNewItem(Player* player, Item* item, uint32 count)
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_STORE_NEW_ITEM, script->OnPlayerStoreNewItem(player, item, count));
 }
 
+bool ScriptMgr::OnPlayerCanStoreProgressionItem(Player* player, ItemTemplate const* item)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_STORE_PROGRESSION_ITEM, !script->OnPlayerCanStoreProgressionItem(player, item));
+}
+
 void ScriptMgr::OnPlayerCreateItem(Player* player, Item* item, uint32 count)
 {
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_CREATE_ITEM, script->OnPlayerCreateItem(player, item, count));
@@ -396,6 +430,11 @@ void ScriptMgr::OnPlayerQuestRewardItem(Player* player, Item* item, uint32 count
 bool ScriptMgr::OnPlayerCanPlaceAuctionBid(Player* player, AuctionEntry* auction)
 {
     CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_PLACE_AUCTION_BID, !script->OnPlayerCanPlaceAuctionBid(player, auction));
+}
+
+bool ScriptMgr::OnPlayerCanCreateProgressionAuction(Player* player, Item* item)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_CREATE_PROGRESSION_AUCTION, !script->OnPlayerCanCreateProgressionAuction(player, item));
 }
 
 void ScriptMgr::OnPlayerGroupRollRewardItem(Player* player, Item* item, uint32 count, RollVote voteType, Roll* roll)
@@ -868,6 +907,21 @@ void ScriptMgr::OnPlayerQuestAccept(Player* player, Quest const* quest)
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT, script->OnPlayerQuestAccept(player, quest));
 }
 
+bool ScriptMgr::OnPlayerCanAcceptQuest(Player* player, Quest const* quest)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_ACCEPT_QUEST, !script->OnPlayerCanAcceptQuest(player, quest));
+}
+
+bool ScriptMgr::OnPlayerCanProgressQuestObjective(Player* player, Quest const* quest)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_PROGRESS_QUEST_OBJECTIVE, !script->OnPlayerCanProgressQuestObjective(player, quest));
+}
+
+bool ScriptMgr::OnPlayerCanRewardQuest(Player* player, Quest const* quest)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_REWARD_QUEST, !script->OnPlayerCanRewardQuest(player, quest));
+}
+
 // Player anti cheat
 void ScriptMgr::AnticheatSetCanFlybyServer(Player* player, bool apply)
 {
@@ -907,6 +961,25 @@ bool ScriptMgr::AnticheatCheckMovementInfo(Player* player, MovementInfo const& m
 bool ScriptMgr::OnPlayerCanUpdateSkill(Player* player, uint32 skillId)
 {
     CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_ON_CAN_UPDATE_SKILL, !script->OnPlayerCanUpdateSkill(player, skillId));
+}
+
+void ScriptMgr::OnPlayerGetProgressionSkillCeiling(Player* player, uint32 skillId, uint32& ceiling)
+{
+    if (ScriptRegistry<PlayerScript>::EnabledHooks[PLAYERHOOK_GET_PROGRESSION_SKILL_CEILING].empty())
+        return;
+
+    for (PlayerScript* script : ScriptRegistry<PlayerScript>::EnabledHooks[PLAYERHOOK_GET_PROGRESSION_SKILL_CEILING])
+    {
+        uint32 scriptCeiling = ceiling;
+        script->OnPlayerGetProgressionSkillCeiling(player, skillId, scriptCeiling);
+        ceiling = std::min(ceiling, scriptCeiling);
+    }
+}
+
+bool ScriptMgr::OnPlayerCanSetProgressionSkill(Player* player, uint32 skillId, uint32 value, uint32 max, uint32 step)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_SET_PROGRESSION_SKILL,
+        !script->OnPlayerCanSetProgressionSkill(player, skillId, value, max, step));
 }
 
 void ScriptMgr::OnPlayerBeforeUpdateSkill(Player* player, uint32 skillId, uint32& value, uint32 max, uint32 step)

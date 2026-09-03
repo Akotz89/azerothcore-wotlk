@@ -775,10 +775,13 @@ void PlayerMenu::SendQuestGiverRequestItems(Quest const* quest, ObjectGuid npcGU
     QuestStatusMap::iterator qsitr = _player->getQuestStatusMap().find(quest->GetQuestId());
     if (qsitr != _player->getQuestStatusMap().end() && qsitr->second.Status == QUEST_STATUS_INCOMPLETE)
     {
-        for (uint8 i = 0; i < 6; ++i)
-            if (quest->RequiredItemId[i] && qsitr->second.ItemCount[i] < quest->RequiredItemCount[i])
-                if (_player->GetItemCount(quest->RequiredItemId[i], false) >= quest->RequiredItemCount[i])
-                    qsitr->second.ItemCount[i] = quest->RequiredItemCount[i];
+        if (sScriptMgr->OnPlayerCanProgressQuestObjective(_player, quest))
+        {
+            for (uint8 i = 0; i < 6; ++i)
+                if (quest->RequiredItemId[i] && qsitr->second.ItemCount[i] < quest->RequiredItemCount[i])
+                    if (_player->GetItemCount(quest->RequiredItemId[i], false) >= quest->RequiredItemCount[i])
+                        qsitr->second.ItemCount[i] = quest->RequiredItemCount[i];
+        }
 
         if (_player->CanCompleteQuest(quest->GetQuestId()))
         {

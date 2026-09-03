@@ -237,6 +237,9 @@ Quest const* Player::GetNextQuest(ObjectGuid guid, Quest const* quest)
 
 bool Player::CanSeeStartQuest(Quest const* quest)
 {
+    if (!sScriptMgr->OnPlayerCanAcceptQuest(this, quest))
+        return false;
+
     if (!sDisableMgr->IsDisabledFor(DISABLE_TYPE_QUEST, quest->GetQuestId(), this) && SatisfyQuestClass(quest, false) && SatisfyQuestRace(quest, false) &&
         SatisfyQuestSkill(quest, false) && SatisfyQuestExclusiveGroup(quest, false) && SatisfyQuestReputation(quest, false) &&
         SatisfyQuestPreviousQuest(quest, false) && SatisfyQuestNextChain(quest, false) &&
@@ -251,7 +254,8 @@ bool Player::CanSeeStartQuest(Quest const* quest)
 
 bool Player::CanTakeQuest(Quest const* quest, bool msg)
 {
-    return !sDisableMgr->IsDisabledFor(DISABLE_TYPE_QUEST, quest->GetQuestId(), this)
+    return sScriptMgr->OnPlayerCanAcceptQuest(this, quest)
+           && !sDisableMgr->IsDisabledFor(DISABLE_TYPE_QUEST, quest->GetQuestId(), this)
            && SatisfyQuestStatus(quest, msg) && SatisfyQuestExclusiveGroup(quest, msg)
            && SatisfyQuestClass(quest, msg) && SatisfyQuestRace(quest, msg) && SatisfyQuestLevel(quest, msg)
            && SatisfyQuestSkill(quest, msg) && SatisfyQuestReputation(quest, msg)
@@ -265,6 +269,9 @@ bool Player::CanTakeQuest(Quest const* quest, bool msg)
 
 bool Player::CanAddQuest(Quest const* quest, bool msg)
 {
+    if (!sScriptMgr->OnPlayerCanAcceptQuest(this, quest))
+        return false;
+
     if (!SatisfyQuestLog(msg))
         return false;
 
@@ -294,6 +301,9 @@ bool Player::CanCompleteQuest(uint32 quest_id, QuestStatusData const* q_savedSta
     {
         Quest const* qInfo = sObjectMgr->GetQuestTemplate(quest_id);
         if (!qInfo)
+            return false;
+
+        if (!sScriptMgr->OnPlayerCanProgressQuestObjective(this, qInfo))
             return false;
 
         // Xinef: take seasonals into account
@@ -386,6 +396,9 @@ bool Player::CanCompleteRepeatableQuest(Quest const* quest)
 
 bool Player::CanRewardQuest(Quest const* quest, bool msg)
 {
+    if (!sScriptMgr->OnPlayerCanRewardQuest(this, quest))
+        return false;
+
     // not auto complete quest and not completed quest (only cheating case, then ignore without message)
     if (!quest->IsDFQuest() && !quest->IsAutoComplete() && quest->GetQuestMethod() && GetQuestStatus(quest->GetQuestId()) != QUEST_STATUS_COMPLETE)
         return false;
@@ -422,6 +435,9 @@ bool Player::CanRewardQuest(Quest const* quest, bool msg)
 
 void Player::AddQuestAndCheckCompletion(Quest const* quest, Object* questGiver)
 {
+    if (!sScriptMgr->OnPlayerCanAcceptQuest(this, quest))
+        return;
+
     AddQuest(quest, questGiver);
     sScriptMgr->OnPlayerQuestAccept(this, quest);
 
@@ -519,6 +535,9 @@ bool Player::CanRewardQuest(Quest const* quest, uint32 reward, bool msg)
 
 void Player::AddQuest(Quest const* quest, Object* questGiver)
 {
+    if (!sScriptMgr->OnPlayerCanAcceptQuest(this, quest))
+        return;
+
     uint16 log_slot = FindQuestSlot(0);
 
     if (log_slot >= MAX_QUEST_LOG_SIZE) // Player does not have any free slot in the quest log
@@ -620,6 +639,10 @@ void Player::CompleteQuest(uint32 quest_id)
         return;
     }
 
+    Quest const* qInfo = sObjectMgr->GetQuestTemplate(quest_id);
+    if (!qInfo || !sScriptMgr->OnPlayerCanProgressQuestObjective(this, qInfo))
+        return;
+
     SetQuestStatus(quest_id, QUEST_STATUS_COMPLETE);
 
     auto log_slot = FindQuestSlot(quest_id);
@@ -628,7 +651,6 @@ void Player::CompleteQuest(uint32 quest_id)
         SetQuestSlotState(log_slot, QUEST_STATE_COMPLETE);
     }
 
-    Quest const* qInfo = sObjectMgr->GetQuestTemplate(quest_id);
     if (qInfo && qInfo->HasFlag(QUEST_FLAGS_TRACKING))
     {
         // auto-rewarded, so CAIS cannot gate it here: the status is already COMPLETE above and
@@ -674,6 +696,9 @@ void Player::IncompleteQuest(uint32 quest_id)
 
 void Player::RewardQuest(Quest const* quest, uint32 reward, Object* questGiver, bool announce, bool isLFGReward)
 {
+    if (!sScriptMgr->OnPlayerCanRewardQuest(this, quest))
+        return;
+
     //this THING should be here to protect code from quest, which cast on player far teleport as a reward
     //should work fine, cause far teleport will be executed in Player::Update()
     SetMustDelayTeleport(true);
@@ -1552,6 +1577,13 @@ bool Player::CanShareQuest(uint32 quest_id) const
 
 void Player::SetQuestStatus(uint32 questId, QuestStatus status, bool update /*= true*/)
 {
+    if (status == QUEST_STATUS_COMPLETE)
+    {
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+        if (!quest || !sScriptMgr->OnPlayerCanProgressQuestObjective(this, quest))
+            return;
+    }
+
     if (Quest const* quest = sObjectMgr->GetQuestTemplate(questId))
     {
         m_QuestStatus[questId].Status = status;
@@ -1866,6 +1898,10 @@ void Player::AreaExploredOrEventHappens(uint32 questId)
 {
     if (questId)
     {
+        Quest const* qInfo = sObjectMgr->GetQuestTemplate(questId);
+        if (!qInfo || !sScriptMgr->OnPlayerCanProgressQuestObjective(this, qInfo))
+            return;
+
         uint16 log_slot = FindQuestSlot(questId);
         QuestStatusData* q_status = nullptr;
         if (log_slot < MAX_QUEST_LOG_SIZE)
@@ -1921,6 +1957,9 @@ void Player::ItemAddedQuestCheck(uint32 entry, uint32 count)
 
         Quest const* qInfo = sObjectMgr->GetQuestTemplate(questid);
         if (!qInfo || !qInfo->HasSpecialFlag(QUEST_SPECIAL_FLAGS_DELIVER))
+            continue;
+
+        if (!sScriptMgr->OnPlayerCanProgressQuestObjective(this, qInfo))
             continue;
 
         for (uint8 j = 0; j < QUEST_ITEM_OBJECTIVES_COUNT; ++j)
@@ -2021,6 +2060,8 @@ void Player::KilledMonsterCredit(uint32 entry, ObjectGuid guid)
         Quest const* qInfo = sObjectMgr->GetQuestTemplate(questid);
         if (!qInfo)
             continue;
+        if (!sScriptMgr->OnPlayerCanProgressQuestObjective(this, qInfo))
+            continue;
         // just if !ingroup || !noraidgroup || raidgroup
         // xinef: or is pvp quest, and player in BG/BF group
         QuestStatusData& q_status = m_QuestStatus[questid];
@@ -2098,6 +2139,9 @@ void Player::KilledPlayerCredit(uint16 count)
 
 void Player::KilledPlayerCreditForQuest(uint16 count, Quest const* quest)
 {
+    if (!sScriptMgr->OnPlayerCanProgressQuestObjective(this, quest))
+        return;
+
     uint32 const questId = quest->GetQuestId();
 
     auto it = m_QuestStatus.find(questId);
@@ -2138,6 +2182,9 @@ void Player::KillCreditGO(uint32 entry, ObjectGuid guid)
 
         Quest const* qInfo = sObjectMgr->GetQuestTemplate(questid);
         if (!qInfo)
+            continue;
+
+        if (!sScriptMgr->OnPlayerCanProgressQuestObjective(this, qInfo))
             continue;
 
         QuestStatusData& q_status = m_QuestStatus[questid];
@@ -2194,6 +2241,9 @@ void Player::TalkedToCreature(uint32 entry, ObjectGuid guid)
 
         Quest const* qInfo = sObjectMgr->GetQuestTemplate(questid);
         if (!qInfo)
+            continue;
+
+        if (!sScriptMgr->OnPlayerCanProgressQuestObjective(this, qInfo))
             continue;
 
         QuestStatusData& q_status = m_QuestStatus[questid];

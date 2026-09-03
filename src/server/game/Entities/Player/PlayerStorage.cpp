@@ -1144,6 +1144,13 @@ InventoryResult Player::CanStoreItem(uint8 bag, uint8 slot, ItemPosCountVec& des
         return swap ? EQUIP_ERR_ITEMS_CANT_BE_SWAPPED : EQUIP_ERR_ITEM_NOT_FOUND;
     }
 
+    if (!pItem && !sScriptMgr->OnPlayerCanStoreProgressionItem(const_cast<Player*>(this), pProto))
+    {
+        if (no_space_count)
+            *no_space_count = count;
+        return EQUIP_ERR_ITEM_CANT_BE_EQUIPPED;
+    }
+
     if (pItem)
     {
         // you bad chet0rz, wpe pro
@@ -6631,6 +6638,18 @@ void Player::_LoadSpells(PreparedQueryResult result)
             Field* fields = result->Fetch();
             uint32 spellId = fields[0].Get<uint32>();
             uint8 specMask = fields[1].Get<uint8>();
+
+            // Persisted spells are loaded through addSpell(..., temporary=true),
+            // which intentionally bypasses the normal learn-time hook. Apply
+            // the same shared-phase predicate here so a character cannot carry
+            // a future spell across a restart and re-enable it merely by
+            // loading from character_spell.
+            if (!sScriptMgr->OnPlayerCanLearnProgressionSpell(this, spellId))
+            {
+                LOG_WARN("entities.player.loading", "Player ({}) has spell {} outside the active progression phase; keeping it inactive until a later phase.",
+                    GetGUID().ToString(), spellId);
+                continue;
+            }
 
             if (CheckSkillLearnedBySpell(spellId))
                 addSpell(spellId, specMask, true);

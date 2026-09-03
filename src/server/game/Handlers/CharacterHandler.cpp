@@ -804,6 +804,23 @@ void WorldSession::HandlePlayerLoginFromDB(LoginQueryHolder const& holder)
     m_playerLoading = true;
     ObjectGuid playerGuid = holder.GetGuid();
 
+    // Give scripts a pre-construction authorization point. Player::LoadFromDB
+    // initializes stats before its load hook runs; a character above the
+    // configured level frontier (especially a disabled heroic class) must be
+    // rejected before that initialization for both clients and Playerbots.
+    if (PreparedQueryResult loadResult = holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_FROM))
+    {
+        Field* fields = loadResult->Fetch();
+        if (!sScriptMgr->OnPlayerCanLoadFromDB(playerGuid, fields[2].Get<std::string>(),
+            fields[3].Get<uint8>(), fields[4].Get<uint8>(), fields[6].Get<uint8>(), fields[20].Get<uint16>(),
+            fields[17].Get<float>(), fields[18].Get<float>(), fields[19].Get<float>(), GetSecurity(), IsBot()))
+        {
+            KickPlayer("WorldSession::HandlePlayerLogin pre-load authorization denied");
+            m_playerLoading = false;
+            return;
+        }
+    }
+
     Player* pCurrChar = new Player(this);
     // for send server info and strings (config)
     ChatHandler chH = ChatHandler(pCurrChar->GetSession());
@@ -814,6 +831,19 @@ void WorldSession::HandlePlayerLoginFromDB(LoginQueryHolder const& holder)
         SetPlayer(nullptr);
         KickPlayer("WorldSession::HandlePlayerLogin Player::LoadFromDB failed"); // disconnect client, player no set to session and it will not deleted or saved at kick
         delete pCurrChar; // delete it manually
+        m_playerLoading = false;
+        return;
+    }
+
+    // PlayerScript load hooks can reject a character by kicking its session.
+    // Stop here before sending login packets or adding the character to a map.
+    // This is also required for socketless Playerbot sessions: unlike a normal
+    // client, they are owned directly by PlayerbotHolder and would otherwise
+    // continue through the complete login path after being kicked.
+    if (IsKicked())
+    {
+        SetPlayer(nullptr);
+        delete pCurrChar;
         m_playerLoading = false;
         return;
     }

@@ -336,10 +336,13 @@ public: /* PlayerScript */
     void OnPlayerBeforeLootMoney(Player* player, Loot* loot);
     void OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, Loot* loot);
     void OnPlayerGiveXP(Player* player, uint32& amount, Unit* victim, uint8 xpSource);
+    void OnPlayerGetProgressionLevelCeiling(Player* player, uint8& ceiling);
+    bool OnPlayerCanProgress(Player* player);
     bool OnPlayerReputationChange(Player* player, uint32 factionID, int32& standing, bool incremental);
     void OnPlayerReputationRankChange(Player* player, uint32 factionID, ReputationRank newRank, ReputationRank oldRank, bool increased);
     void OnPlayerGiveReputation(Player* player, int32 factionID, float& amount, ReputationSource repSource);
     void OnPlayerLearnSpell(Player* player, uint32 spellID);
+    bool OnPlayerCanLearnProgressionSpell(Player* player, uint32 spellID);
     void OnPlayerForgotSpell(Player* player, uint32 spellID);
     void OnPlayerDuelRequest(Player* target, Player* challenger);
     void OnPlayerDuelStart(Player* player1, Player* player2);
@@ -349,6 +352,8 @@ public: /* PlayerScript */
     void OnPlayerTextEmote(Player* player, uint32 textEmote, uint32 emoteNum, ObjectGuid guid);
     void OnPlayerSpellCast(Player* player, Spell* spell, bool skipCheck);
     void OnPlayerLogin(Player* player);
+    bool OnPlayerCanLoadFromDB(ObjectGuid guid, std::string const& name, uint8 race, uint8 classId,
+        uint8 level, uint32 mapId, float x, float y, float z, AccountTypes security, bool isBot);
     void OnPlayerLoadFromDB(Player* player);
     void OnPlayerBeforeLogout(Player* player);
     void OnPlayerLogout(Player* player);
@@ -383,9 +388,11 @@ public: /* PlayerScript */
     void OnPlayerLootItem(Player* player, Item* item, uint32 count, ObjectGuid lootguid);
     void OnPlayerBeforeFillQuestLootItem(Player* player, LootItem& item);
     void OnPlayerStoreNewItem(Player* player, Item* item, uint32 count);
+    bool OnPlayerCanStoreProgressionItem(Player* player, ItemTemplate const* item);
     void OnPlayerCreateItem(Player* player, Item* item, uint32 count);
     void OnPlayerQuestRewardItem(Player* player, Item* item, uint32 count);
     bool OnPlayerCanPlaceAuctionBid(Player* player, AuctionEntry* auction);
+    bool OnPlayerCanCreateProgressionAuction(Player* player, Item* item);
     void OnPlayerGroupRollRewardItem(Player* player, Item* item, uint32 count, RollVote voteType, Roll* roll);
     bool OnPlayerBeforeOpenItem(Player* player, Item* item);
     bool OnPlayerBeforeQuestComplete(Player* player, uint32 quest_id);
@@ -478,11 +485,16 @@ public: /* PlayerScript */
     void OnPlayerLeaveCombat(Player* player);
     void OnPlayerQuestAbandon(Player* player, uint32 questId);
     void OnPlayerQuestAccept(Player* player, Quest const* quest);
+    bool OnPlayerCanAcceptQuest(Player* player, Quest const* quest);
+    bool OnPlayerCanProgressQuestObjective(Player* player, Quest const* quest);
+    bool OnPlayerCanRewardQuest(Player* player, Quest const* quest);
     bool OnPlayerCanSendErrorAlreadyLooted(Player* player);
     void OnPlayerAfterCreatureLoot(Player* player);
     void OnPlayerAfterCreatureLootMoney(Player* player);
     bool OnPlayerCanFlyInZone(Player* player, uint32 mapId, uint32 zoneId, SpellInfo const* bySpell);
     bool OnPlayerCanUpdateSkill(Player* player, uint32 skillId);
+    void OnPlayerGetProgressionSkillCeiling(Player* player, uint32 skillId, uint32& ceiling);
+    bool OnPlayerCanSetProgressionSkill(Player* player, uint32 skillId, uint32 value, uint32 max, uint32 step);
     void OnPlayerBeforeUpdateSkill(Player* player, uint32 skill_id, uint32& value, uint32 max, uint32 step);
     void OnPlayerUpdateSkill(Player* player, uint32 skillId, uint32 value, uint32 max, uint32 step, uint32 newValue);
     void OnPlayerSetSkill(Player* player, uint32 skillId, uint32 value, uint32 max, uint32 step, uint32 newValue);

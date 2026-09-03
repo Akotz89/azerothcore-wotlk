@@ -726,6 +726,10 @@ bool Player::UpdateSkill(uint32 skill_id, uint32 step)
     uint32 value      = SKILL_VALUE(data);
     uint32 max        = SKILL_MAX(data);
 
+    uint32 progressionCeiling = max;
+    sScriptMgr->OnPlayerGetProgressionSkillCeiling(this, skill_id, progressionCeiling);
+    max = std::min(max, progressionCeiling);
+
     sScriptMgr->OnPlayerBeforeUpdateSkill(this, skill_id, value, max, step);
 
     if ((!max) || (!value) || (value >= max))
@@ -941,6 +945,10 @@ bool Player::UpdateSkillPro(uint16 SkillId, int32 Chance, uint32 step)
     uint32 data       = GetUInt32Value(valueIndex);
     uint32 SkillValue = SKILL_VALUE(data);
     uint32 MaxValue   = SKILL_MAX(data);
+
+    uint32 progressionCeiling = MaxValue;
+    sScriptMgr->OnPlayerGetProgressionSkillCeiling(this, SkillId, progressionCeiling);
+    MaxValue = std::min(MaxValue, progressionCeiling);
 
     sScriptMgr->OnPlayerBeforeUpdateSkill(this, SkillId, SkillValue, MaxValue, step);
 
