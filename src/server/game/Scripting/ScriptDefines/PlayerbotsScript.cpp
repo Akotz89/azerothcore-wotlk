@@ -64,6 +64,19 @@ bool ScriptMgr::OnPlayerbotCheckUpdatesToSend(Player* player)
     return true;
 }
 
+bool ScriptMgr::OnPlayerbotCanRunRandomBotMaintenance(Player* player)
+{
+    auto ret = IsValidBoolScript<PlayerbotScript>([&](PlayerbotScript* script)
+    {
+        return !script->OnPlayerbotCanRunRandomBotMaintenance(player);
+    });
+
+    if (ret && *ret)
+        return false;
+
+    return true;
+}
+
 void ScriptMgr::OnPlayerbotPacketSent(Player* player, WorldPacket const* packet)
 {
     ExecuteScript<PlayerbotScript>([&](PlayerbotScript* script)

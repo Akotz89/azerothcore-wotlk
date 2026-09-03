@@ -119,6 +119,7 @@ public:
     virtual void OnPlayerbotCheckKillTask(Player* /*player*/, Unit* /*victim*/) { }
     virtual void OnPlayerbotCheckPetitionAccount(Player* /*player*/, bool& /*found*/) { }
     [[nodiscard]] virtual bool OnPlayerbotCheckUpdatesToSend(Player* /*player*/) { return true; }
+    [[nodiscard]] virtual bool OnPlayerbotCanRunRandomBotMaintenance(Player* /*player*/) { return true; }
     virtual void OnPlayerbotPacketSent(Player* /*player*/, WorldPacket const* /*packet*/) { }
     virtual void OnPlayerbotUpdate(uint32 /*diff*/) { }
     virtual void OnPlayerbotUpdateSessions(Player* /*player*/) { }
@@ -756,6 +757,7 @@ public: /* PlayerbotScript */
     void OnPlayerbotCheckKillTask(Player* player, Unit* victim);
     void OnPlayerbotCheckPetitionAccount(Player* player, bool& found);
     bool OnPlayerbotCheckUpdatesToSend(Player* player);
+    bool OnPlayerbotCanRunRandomBotMaintenance(Player* player);
     void OnPlayerbotPacketSent(Player* player, WorldPacket const* packet);
     void OnPlayerbotUpdate(uint32 diff);
     void OnPlayerbotUpdateSessions(Player* player);
