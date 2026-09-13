@@ -2428,7 +2428,8 @@ void Player::GiveXP(uint32 xp, Unit* victim, float group_rate, bool isLFGReward)
     // Favored experience increase END
 
     // XP to money conversion processed in Player::RewardQuest
-    uint32 maxLevel = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
+    uint32 const realmMaxLevel = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
+    uint32 maxLevel = realmMaxLevel;
 
     // Trial account level cap (0 disables the cap)
     if (uint32 trialLevelCap = sWorld->getIntConfig(CONFIG_TRIAL_LEVEL_CAP))
@@ -2436,7 +2437,14 @@ void Player::GiveXP(uint32 xp, Unit* victim, float group_rate, bool isLFGReward)
             maxLevel = std::min(maxLevel, trialLevelCap);
 
     if (level >= maxLevel)
+    {
+        // A dynamic realm cap is a hard frontier, not a place to accumulate
+        // progress toward the next phase.  Clear any stale value loaded from
+        // the database as well as rejecting the new award.
+        if (level >= realmMaxLevel && GetUInt32Value(PLAYER_XP) != 0)
+            SetUInt32Value(PLAYER_XP, 0);
         return;
+    }
 
     if (HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME))
         xp = std::max(1u, xp / 2);
@@ -2469,6 +2477,12 @@ void Player::GiveXP(uint32 xp, Unit* victim, float group_rate, bool isLFGReward)
             GiveLevel(level + 1);
 
         level = GetLevel();
+        if (level >= realmMaxLevel)
+        {
+            newXP = 0;
+            break;
+        }
+
         nextLvlXP = GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
     }
 
@@ -5087,9 +5101,9 @@ void Player::CleanupChannels()
 }
 
 // Playerbot helper if bot talks in a different locale
-bool Player::IsInChannel(const Channel* c)
+bool Player::IsInChannel(Channel const* c)
 {
-    return std::any_of(m_channels.begin(), m_channels.end(), [c](const Channel* chan)
+    return std::any_of(m_channels.begin(), m_channels.end(), [c](Channel const* chan)
     {
         return c->GetChannelId() == chan->GetChannelId();
     });

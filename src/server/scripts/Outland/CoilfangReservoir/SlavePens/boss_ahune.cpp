@@ -16,6 +16,7 @@
  */
 
 #include "Containers.h"
+#include "Config.h"
 #include "CreatureScript.h"
 #include "CreatureTextMgr.h"
 #include "GameObject.h"
@@ -913,7 +914,8 @@ void AddSC_boss_ahune()
     RegisterTheSlavePensCreatureAI(npc_ahune_bunny);
     RegisterTheSlavePensCreatureAI(npc_ahune_ice_spear_bunny);
     RegisterGameObjectAI(go_ahune_ice_spear);
-    RegisterGameObjectAI(go_ahune_ice_stone);
+    if (!sConfigMgr->GetOption<bool>("ProgressionSystem.Bracket_1_19", false))
+        RegisterGameObjectAI(go_ahune_ice_stone);
     RegisterSpellScript(spell_ahune_synch_health);
     RegisterSpellScript(spell_summoning_rhyme_aura);
     RegisterSpellScript(spell_summon_ice_spear_delayer);

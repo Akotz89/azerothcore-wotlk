@@ -2099,7 +2099,7 @@ public:
 
     void JoinedChannel(Channel* c);
     void LeftChannel(Channel* c);
-    bool IsInChannel(const Channel* c);
+    bool IsInChannel(Channel const* c);
     void CleanupChannels();
     void ClearChannelWatch();
     void UpdateLFGChannel();

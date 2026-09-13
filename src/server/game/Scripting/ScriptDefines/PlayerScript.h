@@ -68,6 +68,7 @@ enum PlayerHook
     PLAYERHOOK_ON_EMOTE,
     PLAYERHOOK_ON_TEXT_EMOTE,
     PLAYERHOOK_ON_SPELL_CAST,
+    PLAYERHOOK_CAN_LOAD_FROM_DB,
     PLAYERHOOK_ON_LOAD_FROM_DB,
     PLAYERHOOK_ON_LOGIN,
     PLAYERHOOK_ON_BEFORE_LOGOUT,
@@ -331,6 +332,10 @@ public:
     virtual void OnPlayerSpellCast(Player* /*player*/, Spell* /*spell*/, bool /*skipCheck*/) { }
 
     // Called during data loading
+    [[nodiscard]] virtual bool OnPlayerCanLoadFromDB(ObjectGuid /*guid*/, std::string const& /*name*/,
+        uint8 /*race*/, uint8 /*classId*/, uint8 /*level*/, uint32 /*mapId*/, float /*x*/, float /*y*/, float /*z*/,
+        AccountTypes /*security*/, bool /*isBot*/) { return true; }
+
     virtual void OnPlayerLoadFromDB(Player* /*player*/) { };
 
     // Called when a player logs in.

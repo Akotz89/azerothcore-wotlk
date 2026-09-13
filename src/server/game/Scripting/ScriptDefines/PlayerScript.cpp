@@ -223,6 +223,13 @@ void ScriptMgr::OnPlayerLogin(Player* player)
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_LOGIN, script->OnPlayerLogin(player));
 }
 
+bool ScriptMgr::OnPlayerCanLoadFromDB(ObjectGuid guid, std::string const& name, uint8 race, uint8 classId,
+    uint8 level, uint32 mapId, float x, float y, float z, AccountTypes security, bool isBot)
+{
+    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_LOAD_FROM_DB,
+        !script->OnPlayerCanLoadFromDB(guid, name, race, classId, level, mapId, x, y, z, security, isBot));
+}
+
 void ScriptMgr::OnPlayerLoadFromDB(Player* player)
 {
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_LOAD_FROM_DB, script->OnPlayerLoadFromDB(player));
