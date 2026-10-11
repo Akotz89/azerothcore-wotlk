@@ -27,8 +27,11 @@
 #include "Opcodes.h"
 #include "Player.h"
 #include "ScriptMgr.h"
+#include "World.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
+
+#include <limits>
 
 void WorldSession::HandleAutostoreLootItemOpcode(WorldPacket& recvData)
 {
@@ -197,75 +200,71 @@ void WorldSession::HandleLootMoneyOpcode(WorldPacket& /*recvData*/)
         }
 
         sScriptMgr->OnPlayerBeforeLootMoney(player, loot);
-        loot->NotifyMoneyRemoved();
-        if (shareMoney && player->GetGroup())      //item, pickpocket and players can be looted only single player
+        bool const splitMoney = shareMoney && player->GetGroup();
+        std::vector<Player*> recipients;
+        if (splitMoney)
         {
-            Group* group = player->GetGroup();
-
-            std::vector<Player*> playersNear;
-            for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
-            {
-                Player* member = itr->GetSource();
-                if (!member)
-                    continue;
-
-                if (player->IsAtLootRewardDistance(member))
-                    playersNear.push_back(member);
-            }
-
-            uint32 goldPerPlayer = uint32((loot->gold) / (playersNear.size()));
-
-            for (std::vector<Player*>::const_iterator i = playersNear.begin(); i != playersNear.end(); ++i)
-            {
-                uint32 finalGold = goldPerPlayer;
-
-                if ((*i)->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME))
-                    continue;
-
-                if ((*i)->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME))
-                {
-                    finalGold /= 2;
-
-                    // a halved share that rounds down to nothing is not worth announcing
-                    if (!finalGold)
-                        continue;
-                }
-
-                (*i)->ModifyMoney(finalGold);
-                (*i)->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_LOOT_MONEY, finalGold);
-
-                WorldPacket data(SMSG_LOOT_MONEY_NOTIFY, 4 + 1);
-                data << uint32(finalGold);
-                data << uint8(playersNear.size() > 1 ? 0 : 1);     // Controls the text displayed in chat. 0 is "Your share is..." and 1 is "You loot..."
-                (*i)->SendDirectMessage(&data);
-            }
+            for (GroupReference* itr = player->GetGroup()->GetFirstMember(); itr != nullptr; itr = itr->next())
+                if (Player* member = itr->GetSource())
+                    if (player->IsAtLootRewardDistance(member))
+                        recipients.push_back(member);
         }
         else
+            recipients.push_back(player);
+        if (recipients.empty())
+            return;
+
+        struct Payment
         {
-            uint32 finalGold = loot->gold;
-            bool award = true; // full restriction already returned above
+            Player* recipient;
+            uint32 amount;
+            uint32 previousMoney;
+        };
+        std::vector<Payment> payments;
+        uint32 const share = uint32(loot->gold / recipients.size());
+        uint32 const trialMoneyCap = sWorld->getIntConfig(CONFIG_TRIAL_MONEY_CAP);
+        for (Player* recipient : recipients)
+        {
+            if (recipient->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME))
+                continue;
+            uint32 amount = share;
+            if (recipient->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME))
+                amount /= 2;
+            if (!amount)
+                continue;
 
-            if (player->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME))
+            uint64 const total = uint64(recipient->GetMoney()) + amount;
+            if (amount > uint32(std::numeric_limits<int32>::max()) || total >= uint64(MAX_MONEY_AMOUNT) ||
+                (trialMoneyCap && recipient->GetSession()->IsTrialAccount() && total > trialMoneyCap))
             {
-                finalGold /= 2;
+                recipient->SendEquipError(EQUIP_ERR_TOO_MUCH_GOLD, nullptr, nullptr);
+                return;
+            }
+            payments.push_back({ recipient, amount, recipient->GetMoney() });
+        }
+        if (payments.empty())
+            return;
 
-                // a halved amount that rounds down to nothing is not worth announcing
-                award = finalGold != 0;
+        // shortcut: custom money hooks need transactional payouts; balance rollback cannot undo their other effects.
+        for (Payment const& payment : payments)
+            if (!payment.recipient->ModifyMoney(int32(payment.amount)))
+            {
+                for (Payment const& rollback : payments)
+                    if (rollback.recipient->GetMoney() != rollback.previousMoney)
+                        rollback.recipient->SetMoney(rollback.previousMoney);
+                return;
             }
 
-            // fire the hook regardless of the CAIS reduction, matching OnLootMoney below
+        if (!splitMoney)
             sScriptMgr->OnPlayerAfterCreatureLootMoney(player);
-
-            if (award)
-            {
-                player->ModifyMoney(finalGold);
-                player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_LOOT_MONEY, finalGold);
-
-                WorldPacket data(SMSG_LOOT_MONEY_NOTIFY, 4 + 1);
-                data << uint32(finalGold);
-                data << uint8(1);   // "You loot..."
-                SendPacket(&data);
-            }
+        loot->NotifyMoneyRemoved();
+        for (Payment const& payment : payments)
+        {
+            payment.recipient->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_LOOT_MONEY, payment.amount);
+            WorldPacket data(SMSG_LOOT_MONEY_NOTIFY, 4 + 1);
+            data << uint32(payment.amount);
+            data << uint8(recipients.size() > 1 ? 0 : 1);
+            payment.recipient->SendDirectMessage(&data);
         }
 
         // reports the amount that dropped, not the CAIS-reduced amount actually awarded;
