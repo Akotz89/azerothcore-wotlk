@@ -2627,6 +2627,8 @@ bool Player::IsMaxLevel() const
 void Player::InitTalentForLevel()
 {
     uint32 talentPointsForLevel = CalculateTalentsPoints();
+    uint8 level = GetLevel();
+    sScriptMgr->OnPlayerBeforeInitTalentForLevel(this, level, talentPointsForLevel);
 
     // if used more than have then reset
     if (m_usedTalentCount > talentPointsForLevel)

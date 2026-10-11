@@ -26,6 +26,12 @@ protected:
     AllItemScript(char const* name);
 
 public:
+    // Handled-result seams are distinct from the existing CanItem* permit checks.
+    [[nodiscard]] virtual bool OnItemQuestAccept(Player* /*player*/, Item* /*item*/, Quest const* /*quest*/) { return false; }
+    [[nodiscard]] virtual bool OnItemExpire(Player* /*player*/, ItemTemplate const* /*proto*/) { return false; }
+    [[nodiscard]] virtual bool OnItemRemove(Player* /*player*/, Item* /*item*/) { return false; }
+    [[nodiscard]] virtual bool CanItemCastCombatSpell(Player* /*player*/, Unit* /*victim*/, SpellInfo const* /*spellInfo*/, Item* /*item*/) { return true; }
+
     // Called when a player accepts a quest from the item.
     [[nodiscard]] virtual bool CanItemQuestAccept(Player* /*player*/, Item* /*item*/, Quest const* /*quest*/) { return true; }
 

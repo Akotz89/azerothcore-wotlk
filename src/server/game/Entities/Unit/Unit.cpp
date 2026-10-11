@@ -12132,6 +12132,11 @@ void Unit::UpdateDamageDoneMods(WeaponAttackType attackType, int32 /*skipEnchant
         if (!(aurEff->GetMiscValue() & SPELL_SCHOOL_MASK_NORMAL))
             return false;
 
+        if (Player* player = ToPlayer())
+            if (!sScriptMgr->OnPlayerCanApplyWeaponDependentAuraDamageMod(player,
+                    player->GetWeaponForAttack(attackType, true), attackType, aurEff, true))
+                return false;
+
         return CheckAttackFitToAuraRequirement(attackType, aurEff);
     });
 
@@ -12173,11 +12178,24 @@ void Unit::UpdateDamagePctDoneMods(WeaponAttackType attackType)
         if (!(aurEff->GetMiscValue() & SPELL_SCHOOL_MASK_NORMAL))
             return false;
 
+        if (Player* player = ToPlayer())
+            if (!sScriptMgr->OnPlayerCanApplyWeaponDependentAuraDamageMod(player,
+                    player->GetWeaponForAttack(attackType, true), attackType, aurEff, true))
+                return false;
+
         return CheckAttackFitToAuraRequirement(attackType, aurEff);
     });
 
     if (attackType == OFF_ATTACK)
-        factor *= GetTotalAuraMultiplier(SPELL_AURA_MOD_OFFHAND_DAMAGE_PCT, std::bind(&Unit::CheckAttackFitToAuraRequirement, this, attackType, std::placeholders::_1));
+        factor *= GetTotalAuraMultiplier(SPELL_AURA_MOD_OFFHAND_DAMAGE_PCT, [attackType, this](AuraEffect const* aurEff) -> bool
+        {
+            if (Player* player = ToPlayer())
+                if (!sScriptMgr->OnPlayerCanApplyWeaponDependentAuraDamageMod(player,
+                        player->GetWeaponForAttack(attackType, true), attackType, aurEff, true))
+                    return false;
+
+            return CheckAttackFitToAuraRequirement(attackType, aurEff);
+        });
 
     SetStatPctModifier(unitMod, TOTAL_PCT, factor);
 }
@@ -16837,6 +16855,9 @@ void Unit::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
                 (index == UNIT_FIELD_AURASTATE && HasFlag(UNIT_FIELD_AURASTATE, PER_CASTER_AURA_STATE_MASK)))
         {
             updateMask.SetBit(index);
+            if (sScriptMgr->IsCustomBuildValuesUpdate(this, updateType, fieldBuffer, target, index))
+                continue;
+
 
             if (index == UNIT_NPC_FLAGS)
             {

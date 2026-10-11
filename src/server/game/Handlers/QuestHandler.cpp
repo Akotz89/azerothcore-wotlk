@@ -224,6 +224,10 @@ void WorldSession::HandleQuestgiverQueryQuestOpcode(WorldPacket& recvData)
         if (!_player->CanTakeQuest(quest, true))
             return;
 
+        if (object->GetTypeId() == TYPEID_UNIT &&
+            sScriptMgr->OnQuestSelect(_player, object->ToCreature(), quest))
+            return;
+
         if (quest->IsAutoAccept() && _player->CanAddQuest(quest, true))
             _player->AddQuestAndCheckCompletion(quest, object);
 
@@ -500,6 +504,10 @@ void WorldSession::HandleQuestgiverCompleteQuest(WorldPacket& recvData)
                            _player->GetName(), _player->GetGUID().ToString(), questId);
             return;
         }
+
+        if (object->GetTypeId() == TYPEID_UNIT &&
+            sScriptMgr->OnQuestComplete(_player, object->ToCreature(), quest))
+            return;
 
         if (Battleground* bg = _player->GetBattleground())
             if (bg->GetBgTypeID(true) == BATTLEGROUND_AV)
