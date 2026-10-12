@@ -11738,13 +11738,13 @@ bool Player::ModifyMoney(int32 amount, bool sendError /*= true*/)
     sScriptMgr->OnPlayerMoneyChanged(this, amount);
 
     if (amount < 0)
-        SetMoney (GetMoney() > uint32(-amount) ? GetMoney() + amount : 0);
+        SetMoney (GetMoney() > uint32(-int64(amount)) ? GetMoney() + amount : 0);
     else
     {
         // Trial account money cap (0 disables the cap)
         if (uint32 trialMoneyCap = sWorld->getIntConfig(CONFIG_TRIAL_MONEY_CAP))
         {
-            if (GetSession()->IsTrialAccount() && GetMoney() + uint32(amount) > trialMoneyCap)
+            if (GetSession()->IsTrialAccount() && uint64(GetMoney()) + uint32(amount) > trialMoneyCap)
             {
                 if (sendError)
                     SendEquipError(EQUIP_ERR_TOO_MUCH_GOLD, nullptr, nullptr);
@@ -11752,7 +11752,7 @@ bool Player::ModifyMoney(int32 amount, bool sendError /*= true*/)
             }
         }
 
-        if (GetMoney() < uint32(MAX_MONEY_AMOUNT - amount))
+        if (uint64(GetMoney()) + uint32(amount) < uint64(MAX_MONEY_AMOUNT))
             SetMoney(GetMoney() + amount);
         else
         {
