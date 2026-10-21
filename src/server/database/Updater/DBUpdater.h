@@ -21,6 +21,7 @@
 #include "DatabaseEnv.h"
 #include "Define.h"
 #include "QueryResult.h"
+#include "StrictProgressionUpdates.h"
 #include <filesystem>
 #include <string>
 
@@ -86,6 +87,8 @@ public:
     static bool Create(DatabaseWorkerPool<T>& pool);
     static bool Update(DatabaseWorkerPool<T>& pool, std::string_view modulesList = {});
     static bool Update(DatabaseWorkerPool<T>& pool, std::vector<std::string> const* setDirectories);
+    static bool UpdateProgression(DatabaseWorkerPool<T>& pool, std::vector<std::string> const& directories,
+        std::vector<StrictProgression::File> const& manifest, std::string const& nativeIdentity, bool auditedAdoption);
     static bool Populate(DatabaseWorkerPool<T>& pool);
 
     // module

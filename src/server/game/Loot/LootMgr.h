@@ -23,6 +23,7 @@
 #include "ObjectGuid.h"
 #include "RefMgr.h"
 #include "SharedDefines.h"
+#include <functional>
 #include <list>
 #include <map>
 #include <unordered_map>
@@ -247,6 +248,9 @@ class LootTemplate
     typedef std::vector<LootGroup*> LootGroups;
 
 public:
+    // Read-only possibility query; no loot roll or inventory mutation.
+    bool HasItemForPlayer(uint32 item, Player const* player, uint16 mode) const;
+    uint32 FindItemForPlayer(std::function<bool(uint32)> const& matches, Player const* player, uint16 mode) const;
     LootTemplate() = default;
     ~LootTemplate();
 
@@ -269,6 +273,7 @@ public:
     [[nodiscard]] bool isReference(uint32 id) const;
 
 private:
+    uint32 FindItemForPlayerImpl(std::function<bool(uint32)> const& matches, Player const* player, uint16 mode, uint8 group, std::set<LootTemplate const*>& seen, uint32& budget) const;
     LootStoreItemList Entries;                          // not grouped only
     LootGroups        Groups;                           // groups have own (optimised) processing, grouped entries go there
 
@@ -320,6 +325,8 @@ struct Loot
     std::vector<LootItem> items;
     std::vector<LootItem> quest_items;
     uint32 gold;
+    uint32 receiptMapId{0}, receiptInstanceId{0};
+    uint64 receiptGeneration{0}; // Passive corpse generation identity, not loot authority.
     uint8 unlootedCount{0};
     ObjectGuid roundRobinPlayer;        // GUID of the player having the Round-Robin ownership for the loot. If 0, round robin owner has released.
     ObjectGuid lootOwnerGUID;
@@ -358,6 +365,8 @@ struct Loot
         items.clear();
         quest_items.clear();
         gold = 0;
+        receiptGeneration = 0;
+        receiptMapId = receiptInstanceId = 0;
         unlootedCount = 0;
         roundRobinPlayer.Clear();
         i_LootValidatorRefMgr.clearReferences();

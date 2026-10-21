@@ -128,6 +128,16 @@ void Player::SetSheath(SheathState sheathed)
 
 uint8 Player::FindEquipSlot(ItemTemplate const* proto, uint32 slot, bool swap) const
 {
+    return FindEquipSlotImpl(proto, slot, swap, false);
+}
+
+uint8 Player::FindEquipSlotBase(ItemTemplate const* proto, uint32 slot, bool swap) const
+{
+    return FindEquipSlotImpl(proto, slot, swap, true);
+}
+
+uint8 Player::FindEquipSlotImpl(ItemTemplate const* proto, uint32 slot, bool swap, bool baseClassOnly) const
+{
     uint8 slots[4];
     slots[0] = NULL_SLOT;
     slots[1] = NULL_SLOT;
@@ -222,23 +232,23 @@ uint8 Player::FindEquipSlot(ItemTemplate const* proto, uint32 slot, bool swap) c
             switch (proto->SubClass)
             {
                 case ITEM_SUBCLASS_ARMOR_LIBRAM:
-                    if (IsClass(CLASS_PALADIN, CLASS_CONTEXT_EQUIP_RELIC))
+                    if (baseClassOnly ? getClass() == CLASS_PALADIN : IsClass(CLASS_PALADIN, CLASS_CONTEXT_EQUIP_RELIC))
                         slots[0] = EQUIPMENT_SLOT_RANGED;
                     break;
                 case ITEM_SUBCLASS_ARMOR_IDOL:
-                    if (IsClass(CLASS_DRUID, CLASS_CONTEXT_EQUIP_RELIC))
+                    if (baseClassOnly ? getClass() == CLASS_DRUID : IsClass(CLASS_DRUID, CLASS_CONTEXT_EQUIP_RELIC))
                         slots[0] = EQUIPMENT_SLOT_RANGED;
                     break;
                 case ITEM_SUBCLASS_ARMOR_TOTEM:
-                    if (IsClass(CLASS_SHAMAN, CLASS_CONTEXT_EQUIP_RELIC))
+                    if (baseClassOnly ? getClass() == CLASS_SHAMAN : IsClass(CLASS_SHAMAN, CLASS_CONTEXT_EQUIP_RELIC))
                         slots[0] = EQUIPMENT_SLOT_RANGED;
                     break;
                 case ITEM_SUBCLASS_ARMOR_MISC:
-                    if (IsClass(CLASS_WARLOCK, CLASS_CONTEXT_EQUIP_RELIC))
+                    if (baseClassOnly ? getClass() == CLASS_WARLOCK : IsClass(CLASS_WARLOCK, CLASS_CONTEXT_EQUIP_RELIC))
                         slots[0] = EQUIPMENT_SLOT_RANGED;
                     break;
                 case ITEM_SUBCLASS_ARMOR_SIGIL:
-                    if (IsClass(CLASS_DEATH_KNIGHT, CLASS_CONTEXT_EQUIP_RELIC))
+                    if (baseClassOnly ? getClass() == CLASS_DEATH_KNIGHT : IsClass(CLASS_DEATH_KNIGHT, CLASS_CONTEXT_EQUIP_RELIC))
                         slots[0] = EQUIPMENT_SLOT_RANGED;
                     break;
             }
@@ -1913,11 +1923,29 @@ InventoryResult Player::CanEquipItem(uint8 slot, uint16& dest, Item* pItem, bool
     if (pItem)
     {
         LOG_DEBUG("entities.player.items", "STORAGE: CanEquipItem slot = {}, item = {}, count = {}", slot, pItem->GetEntry(), pItem->GetCount());
+        ObjectGuid const itemGuid = pItem->GetGUID(), playerGuid = GetGUID();
+        uint8 const originalBag = pItem->GetBagSlot(), originalSlot = pItem->GetSlot();
+        bool const inventoryItem = GetItemByGuid(itemGuid) == pItem;
+        bool const wasInWorld = IsInWorld();
+        uint64 const session = GetSession() ? GetSession()->GetPartySessionIncarnation() : 0;
+        auto refreshItem = [&]()
+        {
+            if ((wasInWorld && ObjectAccessor::FindPlayer(playerGuid) != this) ||
+                (GetSession() ? GetSession()->GetPartySessionIncarnation() : 0) != session ||
+                (GetSession() && !GetSession()->IsNativeMutationAuthorized())) return false;
+            if (!inventoryItem) return true; // Detached native equip probes are owned by their caller.
+            Item* current = GetItemByGuid(itemGuid);
+            if (!current || current->GetOwnerGUID() != playerGuid || current->GetBagSlot() != originalBag ||
+                current->GetSlot() != originalSlot) return false;
+            pItem = current;
+            return true;
+        };
         ItemTemplate const* pProto = pItem->GetTemplate();
         if (pProto)
         {
             if (!sScriptMgr->OnPlayerCanEquipItem(const_cast<Player*>(this), slot, dest, pItem, swap, not_loading))
                 return EQUIP_ERR_CANT_DO_RIGHT_NOW;
+            if (!refreshItem()) return EQUIP_ERR_ITEM_NOT_FOUND;
 
             // item used
             if (pItem->m_lootGenerated)
@@ -1978,6 +2006,7 @@ InventoryResult Player::CanEquipItem(uint8 slot, uint16& dest, Item* pItem, bool
                 return EQUIP_ERR_NOT_WHILE_DISARMED;
 
             res = CanUseItem(pItem, not_loading);
+            if (!refreshItem()) return EQUIP_ERR_ITEM_NOT_FOUND;
             if (res != EQUIP_ERR_OK)
                 return res;
 
@@ -2344,14 +2373,15 @@ InventoryResult Player::CanUseItem(Item* pItem, bool not_loading) const
             if (pItem->IsBindedNotWith(this))
                 return EQUIP_ERR_DONT_OWN_THAT_ITEM;
 
+            // The prototype hook may move or delete this inventory instance.
+            uint32 const itemSkill = pItem->GetSkill();
             InventoryResult res = CanUseItem(pProto);
             if (res != EQUIP_ERR_OK)
                 return res;
 
-            if (pItem->GetSkill() != 0)
+            if (itemSkill != 0)
             {
                 bool allowEquip = false;
-                uint32 itemSkill = pItem->GetSkill();
                 // Armor that is binded to account can "morph" from plate to mail, etc. if skill is not learned yet.
                 if (pProto->Quality == ITEM_QUALITY_HEIRLOOM && pProto->Class == ITEM_CLASS_ARMOR && !HasSkill(itemSkill))
                 {
@@ -2382,7 +2412,7 @@ InventoryResult Player::CanUseItem(Item* pItem, bool not_loading) const
     return EQUIP_ERR_ITEM_NOT_FOUND;
 }
 
-InventoryResult Player::CanUseItem(ItemTemplate const* proto) const
+InventoryResult Player::CanUseItemRequirements(ItemTemplate const* proto) const
 {
     // Used by group, function NeedBeforeGreed, to know if a prototype can be used by a player
 
@@ -2433,6 +2463,15 @@ InventoryResult Player::CanUseItem(ItemTemplate const* proto) const
     {
         return EQUIP_ERR_CANT_DO_RIGHT_NOW;
     }
+
+    return EQUIP_ERR_OK;
+}
+
+InventoryResult Player::CanUseItem(ItemTemplate const* proto) const
+{
+    InventoryResult requirements = CanUseItemRequirements(proto);
+    if (requirements != EQUIP_ERR_OK)
+        return requirements;
 
     InventoryResult result = EQUIP_ERR_OK;
 
@@ -2635,6 +2674,143 @@ void Player::RemoveAmmo()
         UpdateDamagePhysical(RANGED_ATTACK);
 }
 
+bool Player::_StoreGuardedVendorItem(GuardedVendorRequest const& request, GuardedVendorResult& result)
+{
+    auto current = [&]() { return request.locate() == this && _GuardedVendorCurrent(request); };
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(request.item);
+    // Run the progression hook explicitly, then use the native pItem feasibility path to avoid replay.
+    result.stage = "can_store";
+    bool allowed = sScriptMgr->OnPlayerCanStoreProgressionItem(this, proto);
+    if (!current()) { result.reason = "can_store_drift"; return false; }
+    if (!allowed) { result.reason = "cannot_store"; return false; }
+    if (!HasEnoughMoney(request.price)) { result.reason = "insufficient_money"; return false; }
+
+    result.stage = "money_hook";
+    int32 debit = -int32(request.price);
+    sScriptMgr->OnPlayerMoneyChanged(this, debit);
+    if (!current() || debit != -int32(request.price)) { result.reason = "money_hook_drift"; return false; }
+
+    result.stage = "before_store";
+    uint32 item = request.item;
+    Creature* vendor = GetNPCIfCanInteractWith(request.vendorGuid, UNIT_NPC_FLAG_VENDOR);
+    VendorItem const* offer = vendor->GetVendorItems()->GetItem(request.vendorSlot);
+    sScriptMgr->OnPlayerBeforeStoreOrEquipNewItem(this, request.vendorSlot, item, 1,
+        INVENTORY_SLOT_BAG_0, NULL_SLOT, proto, vendor, offer, true);
+    if (!current() || item != request.item) { result.reason = "before_store_drift"; return false; }
+
+    result.stage = "item_create";
+    ObjectGuid const originalOwner = GetGUID();
+    auto discard = [originalOwner](Item* staged)
+    {
+        if (!staged) return;
+        // A creation hook may have independently inserted/transferred the native object.
+        for (ObjectGuid ownerGuid : {originalOwner, staged->GetOwnerGUID()})
+            if (Player* owner = ObjectAccessor::FindConnectedPlayer(ownerGuid))
+                if (owner->GetItemByGuid(staged->GetGUID()) == staged) return;
+        // Creation scripts can enqueue an uninserted object, even for a non-random template.
+        for (ObjectGuid ownerGuid : {originalOwner, staged->GetOwnerGUID()})
+            if (Player* owner = ObjectAccessor::FindConnectedPlayer(ownerGuid))
+                for (Item*& queued : owner->m_itemUpdateQueue)
+                    if (queued == staged) queued = nullptr;
+        delete staged;
+    };
+    Item* staged = Item::CreateItem(request.item, 1, this);
+    if (!current()) { discard(staged); result.reason = "item_create_drift"; return false; }
+    if (!staged) { result.reason = "allocation_failed"; return false; }
+    if (staged->GetEntry() != request.item || staged->GetCount() != 1 ||
+        staged->GetOwnerGUID() != GetGUID() || staged->GetContainer())
+    { discard(staged); result.reason = "created_item_drift"; return false; }
+
+    ItemPosCountVec dest;
+    InventoryResult storage = CanStoreItem(INVENTORY_SLOT_BAG_0, request.destination & 255, dest, staged);
+    if (!current() || storage != EQUIP_ERR_OK || dest.size() != 1 || dest.front().count != 1 || dest.front().pos != request.destination ||
+        (dest.front().pos >> 8) != INVENTORY_SLOT_BAG_0 ||
+        (dest.front().pos & 255) < INVENTORY_SLOT_ITEM_START ||
+        (dest.front().pos & 255) >= INVENTORY_SLOT_ITEM_END || GetItemByPos(dest.front().pos))
+    { discard(staged); result.reason = "no_empty_backpack_placement"; return false; }
+    uint16 const position = dest.front().pos;
+    if (!current()) { discard(staged); result.reason = "final_guard_drift"; return false; }
+
+    // No callbacks between the validated native debit, insertion and copied committed receipt.
+    _StoreItem(position, staged, 1, false, false, &result);
+    // Native stock mutation is part of this commit, before any post-effect callback.
+    vendor = GetNPCIfCanInteractWith(request.vendorGuid, UNIT_NPC_FLAG_VENDOR);
+    offer = vendor->GetVendorItems()->GetItem(request.vendorSlot);
+    uint32 const stock = vendor->UpdateVendorItemCurrentCount(offer, 1);
+
+    // Exported nested quest/money calls inherit this notification context without changing their API.
+    GuardedVendorNotification notifications(this, request.locate, result.itemGuid, request.item);
+    // Economic effects already committed. Ownership drift cannot cancel or refund them.
+    auto actor = [&]() -> Player*
+    {
+        Player* resolved = request.locate();
+        if (!resolved)
+        {
+            result.status = "indeterminate_after_effect";
+            result.reason = "notification_actor_lost";
+            result.observationValid = false;
+        }
+        else
+        {
+            result.observedMoneyAfter = resolved->GetMoney();
+            result.observedItemAfter = resolved->GetItemCount(request.item, false);
+            result.observationValid = true;
+        }
+        return resolved;
+    };
+    auto earned = [&]() -> Item*
+    {
+        Player* resolved = actor();
+        Item* it = resolved ? resolved->GetItemByGuid(result.itemGuid) : nullptr;
+        if (resolved && !it)
+        {
+            result.status = "indeterminate_after_effect";
+            result.reason = "notification_item_lost";
+        }
+        return it;
+    };
+    result.stage = "money_notifications";
+    Player* resolved = actor(); if (!resolved) return true;
+    resolved->MoneyChanged(result.moneyAfter);
+    resolved = actor(); if (!resolved) return true;
+    resolved->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_HIGHEST_GOLD_VALUE_OWNED);
+    resolved = actor(); if (!resolved) return true;
+    if (proto->Quality >= ITEM_QUALITY_RARE) resolved->AdditionalSavingAddMask(ADDITIONAL_SAVING_INVENTORY_AND_GOLD);
+    resolved->ItemAddedQuestCheck(request.item, 1);
+    resolved = actor(); if (!resolved) return true;
+    resolved->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_RECEIVE_EPIC_ITEM, request.item, 1);
+    resolved = actor(); if (!resolved) return true;
+    resolved->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_OWN_ITEM, request.item, 1);
+    resolved = actor(); Item* it = earned(); if (!resolved || !it) return true;
+    if (resolved->IsInWorld()) { it->AddToWorld(); it->SendUpdateToPlayer(resolved); }
+    resolved->AddEnchantmentDurations(it);
+    resolved->AddItemDurations(it);
+    resolved->ApplyItemObtainSpells(it, true, &request.locate);
+    resolved = actor(); it = earned(); if (!resolved || !it) return true;
+    sScriptMgr->OnPlayerStoreNewItem(resolved, it, 1);
+    resolved = actor(); it = earned(); if (!resolved || !it) return true;
+    vendor = resolved->GetNPCIfCanInteractWith(request.vendorGuid, UNIT_NPC_FLAG_VENDOR);
+    if (!vendor || vendor->GetEntry() != request.vendorEntry || !vendor->GetVendorItems() ||
+        request.vendorSlot >= vendor->GetVendorItems()->GetItemCount())
+    { result.status = "indeterminate_after_effect"; result.reason = "notification_vendor_lost"; return true; }
+    offer = vendor->GetVendorItems()->GetItem(request.vendorSlot);
+    if (!offer || offer->item != request.item)
+    { result.status = "indeterminate_after_effect"; result.reason = "notification_offer_lost"; return true; }
+    WorldPacket packet(SMSG_BUY_ITEM, (8 + 4 + 4 + 4));
+    packet << request.vendorGuid << uint32(request.vendorSlot + 1)
+        << int32(offer->maxcount ? stock : 0xFFFFFFFF) << uint32(1);
+    resolved->SendDirectMessage(&packet);
+    resolved->SendNewItem(it, 1, true, false, false);
+    sScriptMgr->OnPlayerAfterStoreOrEquipNewItem(resolved, request.vendorSlot, it, 1,
+        INVENTORY_SLOT_BAG_0, NULL_SLOT, proto, vendor, offer, true);
+    resolved = actor(); it = earned();
+    if (!resolved || !it || !request.current() || resolved->GetMoney() != result.moneyAfter ||
+        resolved->GetItemCount(request.item, false) != result.itemAfter)
+    { result.status = "indeterminate_after_effect"; if (result.reason.empty()) result.reason = "post_commit_drift"; }
+    result.stage = "notifications_complete";
+    return true;
+}
+
 Item* Player::StoreNewItem(ItemPosCountVec const& dest, uint32 item, bool update, int32 randomPropertyId, bool refund)
 {
     AllowedLooterSet allowedLooters;
@@ -2716,7 +2892,7 @@ Item* Player::StoreItem(ItemPosCountVec const& dest, Item* pItem, bool update)
 }
 
 // Return stored item (if stored to stack, it can diff. from pItem). And pItem ca be deleted in this case.
-Item* Player::_StoreItem(uint16 pos, Item* pItem, uint32 count, bool clone, bool update)
+Item* Player::_StoreItem(uint16 pos, Item* pItem, uint32 count, bool clone, bool update, GuardedVendorResult* receipt)
 {
     if (!pItem)
         return nullptr;
@@ -2760,6 +2936,23 @@ Item* Player::_StoreItem(uint16 pos, Item* pItem, uint32 count, bool clone, bool
         }
         else
             pBag->StoreItem(slot, pItem, update);
+
+        if (receipt)
+        {
+            // Empty backpack placement only: all operations through this receipt are callback-free.
+            SetUInt32Value(PLAYER_FIELD_COINAGE, receipt->moneyBefore - receipt->price);
+            pItem->SetState(ITEM_CHANGED, this);
+            receipt->itemGuid = pItem->GetGUID();
+            receipt->moneyAfter = GetMoney();
+            receipt->itemAfter = receipt->itemBefore + 1;
+            receipt->observedMoneyAfter = receipt->moneyAfter;
+            receipt->observedItemAfter = receipt->itemAfter;
+            receipt->observationValid = true;
+            receipt->status = "committed";
+            receipt->reason.clear();
+            receipt->stage = "committed";
+            return pItem;
+        }
 
         if (IsInWorld() && update)
         {
@@ -3652,6 +3845,32 @@ void Player::SwapItem(uint16 src, uint16 dst)
     if (!pSrcItem)
         return;
 
+    ObjectGuid const sourceGuid = pSrcItem->GetGUID(), destinationGuid = pDstItem ? pDstItem->GetGUID() : ObjectGuid::Empty;
+    ObjectGuid const playerGuid = GetGUID();
+    uint64 const session = GetSession() ? GetSession()->GetPartySessionIncarnation() : 0;
+    bool enchantmentsRemoved = false;
+    auto refreshItems = [&]()
+    {
+        if (ObjectAccessor::FindPlayer(playerGuid) != this || !GetSession() ||
+            GetSession()->GetPartySessionIncarnation() != session || GetSession()->isLogingOut()) return false;
+        Item* source = GetItemByPos(srcbag, srcslot);
+        Item* destination = GetItemByPos(dstbag, dstslot);
+        bool sourceValid = source && source->GetGUID() == sourceGuid && source->GetOwnerGUID() == playerGuid;
+        bool destinationValid = destinationGuid ? (destination && destination->GetGUID() == destinationGuid &&
+            destination->GetOwnerGUID() == playerGuid) : !destination;
+        if (!sourceValid || !destinationValid || !GetSession()->IsNativeMutationAuthorized())
+        {
+            // Restore only unchanged live originals; nested native actions own moved/removed items.
+            if (enchantmentsRemoved)
+            {
+                if (sourceValid) ApplyEnchantment(source, true);
+                if (destinationValid && destination) ApplyEnchantment(destination, true);
+            }
+            return false;
+        }
+        pSrcItem = source; pDstItem = destination;
+        return true;
+    };
     LOG_DEBUG("entities.player.items", "STORAGE: SwapItem bag = {}, slot = {}, item = {}", dstbag, dstslot, pSrcItem->GetEntry());
 
     if (!IsAlive())
@@ -3674,6 +3893,7 @@ void Player::SwapItem(uint16 src, uint16 dst)
     {
         // bags can be swapped with empty bag slots, or with empty bag (items move possibility checked later)
         InventoryResult msg = CanUnequipItem(src, !IsBagPos(src) || IsBagPos(dst) || (pDstItem && pDstItem->ToBag() && pDstItem->ToBag()->IsEmpty()));
+        if (!refreshItems()) return;
         if (msg != EQUIP_ERR_OK)
         {
             SendEquipError(msg, pSrcItem, pDstItem);
@@ -3720,6 +3940,7 @@ void Player::SwapItem(uint16 src, uint16 dst)
         {
             // bags can be swapped with empty bag slots, or with empty bag (items move possibility checked later)
             InventoryResult msg = CanUnequipItem(dst, !IsBagPos(dst) || IsBagPos(src) || (pSrcItem->ToBag() && pSrcItem->ToBag()->IsEmpty()));
+        if (!refreshItems()) return;
             if (msg != EQUIP_ERR_OK)
             {
                 SendEquipError(msg, pSrcItem, pDstItem);
@@ -3738,6 +3959,7 @@ void Player::SwapItem(uint16 src, uint16 dst)
         {
             ItemPosCountVec dest;
             InventoryResult msg = CanStoreItem(dstbag, dstslot, dest, pSrcItem, false);
+            if (!refreshItems()) return;
             if (msg != EQUIP_ERR_OK)
             {
                 SendEquipError(msg, pSrcItem, nullptr);
@@ -3754,6 +3976,7 @@ void Player::SwapItem(uint16 src, uint16 dst)
         {
             ItemPosCountVec dest;
             InventoryResult msg = CanBankItem(dstbag, dstslot, dest, pSrcItem, false);
+            if (!refreshItems()) return;
             if (msg != EQUIP_ERR_OK)
             {
                 SendEquipError(msg, pSrcItem, nullptr);
@@ -3769,6 +3992,7 @@ void Player::SwapItem(uint16 src, uint16 dst)
         {
             uint16 dest;
             InventoryResult msg = CanEquipItem(dstslot, dest, pSrcItem, false);
+            if (!refreshItems()) return;
             if (msg != EQUIP_ERR_OK)
             {
                 SendEquipError(msg, pSrcItem, nullptr);
@@ -3801,6 +4025,7 @@ void Player::SwapItem(uint16 src, uint16 dst)
         else
             return;
 
+        if (!refreshItems()) return;
         // can be merge/fill
         if (msg == EQUIP_ERR_OK)
         {
@@ -3843,6 +4068,7 @@ void Player::SwapItem(uint16 src, uint16 dst)
         ApplyEnchantment(pDstItem, false);
     }
 
+    enchantmentsRemoved = true;
     // impossible merge/fill, do real swap
     InventoryResult msg = EQUIP_ERR_OK;
 
@@ -3856,10 +4082,12 @@ void Player::SwapItem(uint16 src, uint16 dst)
     else if (IsEquipmentPos(dst))
     {
         msg = CanEquipItem(dstslot, eDest, pSrcItem, true);
+        if (!refreshItems()) return;
         if (msg == EQUIP_ERR_OK)
             msg = CanUnequipItem(eDest, true);
     }
 
+    if (!refreshItems()) return;
     if (msg != EQUIP_ERR_OK)
     {
         // Restore enchantments
@@ -3883,10 +4111,12 @@ void Player::SwapItem(uint16 src, uint16 dst)
     else if (IsEquipmentPos(src))
     {
         msg = CanEquipItem(srcslot, eDest2, pDstItem, true);
+        if (!refreshItems()) return;
         if (msg == EQUIP_ERR_OK)
             msg = CanUnequipItem(eDest2, true);
     }
 
+    if (!refreshItems()) return;
     if (msg != EQUIP_ERR_OK)
     {
         // Restore enchantments
@@ -3907,6 +4137,7 @@ void Player::SwapItem(uint16 src, uint16 dst)
         ApplyEnchantment(pDstItem, true);
     }
 
+    enchantmentsRemoved = false;
     // Check bag swap with item exchange (one from empty in not bag possition (equipped (not possible in fact) or store)
     if (Bag* srcBag = pSrcItem->ToBag())
     {

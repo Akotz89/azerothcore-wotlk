@@ -183,6 +183,7 @@ void ScriptMgr::OnUnloadGridMap(Map* map, GridTerrainData* gmap, uint32 gx, uint
 
 void ScriptMgr::OnPlayerEnterMap(Map* map, Player* player)
 {
+    ScopedNativeQuestLifecycleContext observationContext(player, PLAYERHOOK_ON_MAP_CHANGED);
     ASSERT(map);
     ASSERT(player);
 

@@ -172,7 +172,13 @@ bool MySQLConnection::PrepareStatements()
     return !m_prepareError;
 }
 
-bool MySQLConnection::Execute(std::string_view sql)
+static bool IsReconnectError(uint32 errorCode)
+{
+    return errorCode == CR_SERVER_GONE_ERROR || errorCode == CR_SERVER_LOST ||
+        errorCode == CR_SERVER_LOST_EXTENDED || errorCode == CR_CONN_HOST_ERROR;
+}
+
+bool MySQLConnection::Execute(std::string_view sql, bool allowReconnect)
 {
     if (!m_Mysql)
         return false;
@@ -187,8 +193,8 @@ bool MySQLConnection::Execute(std::string_view sql)
             LOG_INFO("sql.sql", "SQL: {}", sql);
             LOG_ERROR("sql.sql", "[{}] {}", lErrno, mysql_error(m_Mysql));
 
-            if (_HandleMySQLErrno(lErrno, mysql_error(m_Mysql)))  // If it returns true, an error was handled successfully (i.e. reconnection)
-                return Execute(sql);       // Try again
+            if ((allowReconnect || !IsReconnectError(lErrno)) && _HandleMySQLErrno(lErrno, mysql_error(m_Mysql)))  // If it returns true, an error was handled successfully (i.e. reconnection)
+                return Execute(sql, allowReconnect);       // Try again
 
             return false;
         }
@@ -199,7 +205,7 @@ bool MySQLConnection::Execute(std::string_view sql)
     return true;
 }
 
-bool MySQLConnection::Execute(PreparedStatementBase* stmt)
+bool MySQLConnection::Execute(PreparedStatementBase* stmt, bool allowReconnect)
 {
     if (!m_Mysql)
         return false;
@@ -225,8 +231,8 @@ bool MySQLConnection::Execute(PreparedStatementBase* stmt)
         uint32 lErrno = mysql_errno(m_Mysql);
         LOG_ERROR("sql.sql", "SQL(p): {}\n [ERROR]: [{}] {}", m_mStmt->getQueryString(), lErrno, mysql_stmt_error(msql_STMT));
 
-        if (_HandleMySQLErrno(lErrno, mysql_stmt_error(msql_STMT)))  // If it returns true, an error was handled successfully (i.e. reconnection)
-            return Execute(stmt);       // Try again
+        if ((allowReconnect || !IsReconnectError(lErrno)) && _HandleMySQLErrno(lErrno, mysql_stmt_error(msql_STMT)))  // If it returns true, an error was handled successfully (i.e. reconnection)
+            return Execute(stmt, allowReconnect);       // Try again
 
         m_mStmt->ClearParameters();
         return false;
@@ -237,8 +243,8 @@ bool MySQLConnection::Execute(PreparedStatementBase* stmt)
         uint32 lErrno = mysql_errno(m_Mysql);
         LOG_ERROR("sql.sql", "SQL(p): {}\n [ERROR]: [{}] {}", m_mStmt->getQueryString(), lErrno, mysql_stmt_error(msql_STMT));
 
-        if (_HandleMySQLErrno(lErrno, mysql_stmt_error(msql_STMT)))  // If it returns true, an error was handled successfully (i.e. reconnection)
-            return Execute(stmt);       // Try again
+        if ((allowReconnect || !IsReconnectError(lErrno)) && _HandleMySQLErrno(lErrno, mysql_stmt_error(msql_STMT)))  // If it returns true, an error was handled successfully (i.e. reconnection)
+            return Execute(stmt, allowReconnect);       // Try again
 
         m_mStmt->ClearParameters();
         return false;
@@ -364,19 +370,19 @@ bool MySQLConnection::_Query(std::string_view sql, MySQLResult** pResult, MySQLF
     return true;
 }
 
-void MySQLConnection::BeginTransaction()
+bool MySQLConnection::BeginTransaction()
 {
-    Execute("START TRANSACTION");
+    return Execute("START TRANSACTION");
 }
 
 void MySQLConnection::RollbackTransaction()
 {
-    Execute("ROLLBACK");
+    Execute("ROLLBACK", false);
 }
 
-void MySQLConnection::CommitTransaction()
+bool MySQLConnection::CommitTransaction()
 {
-    Execute("COMMIT");
+    return Execute("COMMIT", false);
 }
 
 int MySQLConnection::ExecuteTransaction(std::shared_ptr<TransactionBase> transaction)
@@ -385,7 +391,12 @@ int MySQLConnection::ExecuteTransaction(std::shared_ptr<TransactionBase> transac
     if (queries.empty())
         return -1;
 
-    BeginTransaction();
+    // Reconnecting would discard the transaction and execute its suffix in autocommit mode.
+    if (!BeginTransaction())
+    {
+        uint32 errorCode = GetLastError();
+        return errorCode ? errorCode : CR_UNKNOWN_ERROR;
+    }
 
     for (auto const& data : queries)
     {
@@ -407,12 +418,12 @@ int MySQLConnection::ExecuteTransaction(std::shared_ptr<TransactionBase> transac
 
                 ASSERT(stmt);
 
-                if (!Execute(stmt))
+                if (!Execute(stmt, false))
                 {
                     LOG_WARN("sql.sql", "Transaction aborted. {} queries not executed.", queries.size());
                     int errorCode = GetLastError();
                     RollbackTransaction();
-                    return errorCode;
+                    return errorCode ? errorCode : CR_UNKNOWN_ERROR;
                 }
             }
             break;
@@ -432,12 +443,12 @@ int MySQLConnection::ExecuteTransaction(std::shared_ptr<TransactionBase> transac
 
                 ASSERT(!sql.empty());
 
-                if (!Execute(sql))
+                if (!Execute(sql, false))
                 {
                     LOG_WARN("sql.sql", "Transaction aborted. {} queries not executed.", queries.size());
                     uint32 errorCode = GetLastError();
                     RollbackTransaction();
-                    return errorCode;
+                    return errorCode ? errorCode : CR_UNKNOWN_ERROR;
                 }
             }
             break;
@@ -449,7 +460,13 @@ int MySQLConnection::ExecuteTransaction(std::shared_ptr<TransactionBase> transac
     // This is done in calling functions DatabaseWorkerPool<T>::DirectCommitTransaction and TransactionTask::Execute,
     // and not while iterating over every element.
 
-    CommitTransaction();
+    if (!CommitTransaction())
+    {
+        uint32 errorCode = GetLastError();
+        RollbackTransaction();
+        return errorCode ? errorCode : CR_UNKNOWN_ERROR;
+    }
+
     return 0;
 }
 
@@ -465,7 +482,7 @@ void MySQLConnection::Ping()
 
 uint32 MySQLConnection::GetLastError()
 {
-    return mysql_errno(m_Mysql);
+    return m_Mysql ? mysql_errno(m_Mysql) : CR_UNKNOWN_ERROR;
 }
 
 bool MySQLConnection::LockIfReady()

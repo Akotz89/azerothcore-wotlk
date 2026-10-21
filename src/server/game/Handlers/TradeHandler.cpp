@@ -839,9 +839,22 @@ void WorldSession::HandleInitiateTradeOpcode(WorldPacket& recvPacket)
         return;
     }
 
-    if (!sScriptMgr->OnPlayerCanInitTrade(_player, pOther))
+    Player* const actor = _player;
+    ObjectGuid const actorGuid = actor->GetGUID(), otherGuid = pOther->GetGUID();
+    uint64 const otherSession = pOther->GetSession()->GetPartySessionIncarnation();
+    if (!sScriptMgr->OnPlayerCanInitTrade(actor, pOther))
         return;
 
+    if (_player != actor || ObjectAccessor::FindPlayer(actorGuid) != actor || actor->GetSession() != this ||
+        isLogingOut() || !actor->IsInWorld() || !actor->IsAlive() || actor->IsInFlight() ||
+        actor->HasUnitState(UNIT_STATE_STUNNED) || actor->GetTradeData()) return;
+    pOther = ObjectAccessor::FindPlayer(otherGuid);
+    if (!pOther || !pOther->GetSession() || pOther->GetSession()->GetPartySessionIncarnation() != otherSession ||
+        pOther->GetSession()->isLogingOut() || !pOther->IsInWorld() || !pOther->IsAlive() || pOther->IsInFlight() ||
+        pOther->HasUnitState(UNIT_STATE_STUNNED) || pOther->GetTradeData() ||
+        !pOther->IsWithinDistInMap(actor, TRADE_DISTANCE, false) ||
+        (pOther->GetTeamId() != actor->GetTeamId() && !HasPermission(rbac::RBAC_PERM_ALLOW_TWO_SIDE_TRADE))) return;
+    if (!IsNativeMutationAuthorized()) return;
     // OK start trade
     _player->m_trade = new TradeData(_player, pOther);
     pOther->m_trade = new TradeData(pOther, _player);
@@ -869,6 +882,11 @@ void WorldSession::HandleSetTradeGoldOpcode(WorldPacket& recvPacket)
 
 void WorldSession::HandleSetTradeItemOpcode(WorldPacket& recvPacket)
 {
+    (void)TrySetTradeItem(recvPacket);
+}
+
+bool WorldSession::TrySetTradeItem(WorldPacket& recvPacket, std::function<bool()> const& authorize)
+{
     // send update
     uint8 tradeSlot;
     uint8 bag;
@@ -880,7 +898,7 @@ void WorldSession::HandleSetTradeItemOpcode(WorldPacket& recvPacket)
 
     TradeData* my_trade = _player->GetTradeData();
     if (!my_trade)
-        return;
+        return false;
 
     TradeStatusInfo info;
     // invalid slot number
@@ -888,7 +906,7 @@ void WorldSession::HandleSetTradeItemOpcode(WorldPacket& recvPacket)
     {
         info.Status = TRADE_STATUS_TRADE_CANCELED;
         SendTradeStatus(info);
-        return;
+        return false;
     }
 
     // check cheating, can't fail with correct client operations
@@ -897,7 +915,7 @@ void WorldSession::HandleSetTradeItemOpcode(WorldPacket& recvPacket)
     {
         info.Status = TRADE_STATUS_TRADE_CANCELED;
         SendTradeStatus(info);
-        return;
+        return false;
     }
 
     ObjectGuid iGUID = item->GetGUID();
@@ -908,9 +926,12 @@ void WorldSession::HandleSetTradeItemOpcode(WorldPacket& recvPacket)
         // cheating attempt
         info.Status = TRADE_STATUS_TRADE_CANCELED;
         SendTradeStatus(info);
-        return;
+        return false;
     }
 
+    Player* const actor = _player;
+    ObjectGuid const actorGuid = actor->GetGUID(), otherGuid = my_trade->GetTrader()->GetGUID();
+    uint64 const otherSession = my_trade->GetTrader()->GetSession()->GetPartySessionIncarnation();
     // PlayerScript Hook for checking traded items if we want to filter them in a custom module
     if (!sScriptMgr->OnPlayerCanSetTradeItem(_player, item, tradeSlot))
     {
@@ -918,18 +939,30 @@ void WorldSession::HandleSetTradeItemOpcode(WorldPacket& recvPacket)
         // On the trade initiator screen
         info.Status = TRADE_STATUS_CLOSE_WINDOW;
         SendTradeStatus(info);
-        return;
+        return false;
     }
 
+    if (_player != actor || ObjectAccessor::FindPlayer(actorGuid) != actor || actor->GetSession() != this ||
+        isLogingOut() || !actor->IsInWorld()) return false;
+    Player* other = ObjectAccessor::FindPlayer(otherGuid);
+    my_trade = actor->GetTradeData();
+    if (!other || !other->GetSession() || other->GetSession()->GetPartySessionIncarnation() != otherSession ||
+        other->GetSession()->isLogingOut() || !my_trade || my_trade->GetTrader() != other ||
+        !other->GetTradeData() || other->GetTradeData()->GetTrader() != actor) return false;
+    item = actor->GetItemByPos(bag, slot);
+    if (!item || item->GetGUID() != iGUID || item->GetOwnerGUID() != actorGuid ||
+        my_trade->HasItem(iGUID) || (tradeSlot != TRADE_SLOT_NONTRADED && !item->CanBeTraded(false, true))) return false;
     if (tradeSlot != TRADE_SLOT_NONTRADED && item->IsBindedNotWith(my_trade->GetTrader()))
     {
         info.Status = TRADE_STATUS_NOT_ON_TAPLIST;
         info.Slot = tradeSlot;
         SendTradeStatus(info);
-        return;
+        return false;
     }
 
+    if (authorize && !authorize()) return false;
     my_trade->SetItem(TradeSlots(tradeSlot), item);
+    return true;
 }
 
 void WorldSession::HandleClearTradeItemOpcode(WorldPacket& recvPacket)

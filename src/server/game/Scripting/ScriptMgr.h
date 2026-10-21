@@ -78,6 +78,7 @@ class WorldObject;
 class WorldPacket;
 class WorldSocket;
 class CharacterCreateInfo;
+class TransactionCallback;
 class SpellScriptLoader;
 
 struct AchievementCriteriaData;
@@ -125,6 +126,26 @@ public:
     virtual void OnPlayerbotUpdateSessions(Player* /*player*/) { }
     virtual void OnPlayerbotLogout(Player* /*player*/) { }
     virtual void OnPlayerbotLogoutBots() { }
+};
+
+// Synchronous current lifecycle dispatch binding; copied values, restored across nested calls.
+struct NativeQuestLifecycleContext
+{
+    uint64 dispatchSequence{0}, actorGuid{0}, sessionIncarnation{0};
+    uint32 accountId{0}, hookId{0}, questId{0};
+    bool active{false};
+};
+
+class ScopedNativeQuestLifecycleContext
+{
+    friend class ScriptMgr;
+    NativeQuestLifecycleContext previous, current;
+    ScopedNativeQuestLifecycleContext* previousScope{nullptr};
+public:
+    ScopedNativeQuestLifecycleContext(Player* actor, uint32 hookId, uint32 questId = 0) noexcept;
+    ~ScopedNativeQuestLifecycleContext() noexcept;
+    ScopedNativeQuestLifecycleContext(ScopedNativeQuestLifecycleContext const&) = delete;
+    ScopedNativeQuestLifecycleContext& operator=(ScopedNativeQuestLifecycleContext const&) = delete;
 };
 
 class ScriptMgr
@@ -391,6 +412,12 @@ public: /* PlayerScript */
     bool OnPlayerCanStoreProgressionItem(Player* player, ItemTemplate const* item);
     void OnPlayerCreateItem(Player* player, Item* item, uint32 count);
     void OnPlayerQuestRewardItem(Player* player, Item* item, uint32 count);
+    [[nodiscard]] bool ShouldObserveQuestReward(uint64 actorGuid, uint32 accountId, uint64 session, uint32 questId) noexcept;
+    void OnPlayerQuestRewardDestinations(NativeQuestRewardObservation const& observation) noexcept;
+    [[nodiscard]] NativeQuestLifecycleContext ReadQuestLifecycleContext(uint32 depth = 0) const noexcept;
+    uint64 NextQuestRewardMailOperation() noexcept;
+    void TrackQuestRewardMailTransaction(TransactionCallback&& callback, std::vector<NativeQuestRewardObservation>&& observations) noexcept;
+    void PollQuestRewardMailTransactions() noexcept;
     bool OnPlayerCanPlaceAuctionBid(Player* player, AuctionEntry* auction);
     bool OnPlayerCanCreateProgressionAuction(Player* player, Item* item);
     void OnPlayerGroupRollRewardItem(Player* player, Item* item, uint32 count, RollVote voteType, Roll* roll);

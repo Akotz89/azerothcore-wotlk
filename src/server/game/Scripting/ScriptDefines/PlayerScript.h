@@ -27,6 +27,37 @@
 #include "AchievementMgr.h"
 #include "KillRewarder.h"
 
+// Copied ordinary quest storage witnesses; no Item/Quest/Player pointer crosses the hook.
+struct NativeQuestRewardDestination
+{
+    uint16 bagSlot{0};
+    uint32 plannedCount{0}, beforeEntry{0}, itemEntry{0}, beforeCount{0}, afterCount{0}, delta{0};
+    uint64 beforeGuid{0}, itemGuid{0};
+    bool matched{false};
+};
+struct NativeQuestRewardMailAttachment
+{
+    uint64 itemGuid{0};
+    uint32 itemEntry{0}, count{0}, savedEntry{0}, savedCount{0};
+    bool savedValueMatched{false};
+};
+struct NativeQuestRewardMailEnvelope
+{
+    uint32 mailId{0}, receiverGuid{0};
+    uint64 deliverTime{0};
+    bool queued{false};
+    std::vector<NativeQuestRewardMailAttachment> attachments;
+};
+struct NativeQuestRewardObservation
+{
+    uint64 actorGuid{0}, sessionIncarnation{0}, countSum{0}, operationId{0};
+    uint32 accountId{0}, questId{0}, rewardIndex{0}, itemEntry{0}, count{0};
+    std::string rewardKind, deliveryReason;
+    bool complete{false}, deliveryPending{false}, deliveryKnown{false}, transactionCommitted{false}, queuedComplete{false};
+    std::vector<NativeQuestRewardDestination> destinations;
+    std::vector<NativeQuestRewardMailEnvelope> mailEnvelopes;
+};
+
 enum PlayerHook
 {
     PLAYERHOOK_ON_PLAYER_JUST_DIED,
@@ -232,6 +263,7 @@ enum PlayerHook
     PLAYERHOOK_ON_GET_REPUTATION_PRICE_DISCOUNT,
     PLAYERHOOK_ON_LEARN_TAXI_NODE,
     PLAYERHOOK_ON_BEFORE_GET_LEVEL_FOR_XP_GAIN,
+    PLAYERHOOK_ON_QUEST_REWARD_DESTINATIONS,
     PLAYERHOOK_END
 };
 
@@ -469,6 +501,9 @@ public:
 
     // After receiving item as a quest reward
     virtual void OnPlayerQuestRewardItem(Player* /*player*/, Item* /*item*/, uint32 /*count*/) { }
+    // Passive opt-in for the existing value-observation listener, before any destination/mail preparation.
+    virtual bool ShouldObserveQuestReward(uint64 /*actorGuid*/, uint32 /*accountId*/, uint64 /*session*/, uint32 /*questId*/) { return false; }
+    virtual void OnPlayerQuestRewardDestinations(NativeQuestRewardObservation const& /*observation*/) { }
 
     // When placing a bid or buying out an auction
     [[nodiscard]] virtual bool OnPlayerCanPlaceAuctionBid(Player* /*player*/, AuctionEntry* /*auction*/) { return true; }

@@ -16,11 +16,52 @@
  */
 
 #include "PlayerScript.h"
+#include "Transaction.h"
+#include <list>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include "ObjectAccessor.h"
+#include "Player.h"
+#include "QuestDef.h"
+#include "Item.h"
+#include "WorldSession.h"
+#include "Spell.h"
 #include "ScriptMgr.h"
 #include "ScriptMgrMacros.h"
 #include "World.h"
 
 #include <algorithm>
+
+// PARTY_NATIVE_ITEM_HOOK_STATE_BEGIN
+namespace
+{
+struct NativeItemHookState
+{
+    Player* player;
+    ObjectGuid playerGuid, itemGuid;
+    uint8 bag, slot;
+    uint64 session;
+    bool inventoryItem, wasInWorld;
+    NativeItemHookState(Player* value, Item* item)
+        : player(value), playerGuid(value->GetGUID()), itemGuid(item ? item->GetGUID() : ObjectGuid::Empty),
+          bag(item ? item->GetBagSlot() : uint8(NULL_BAG)), slot(item ? item->GetSlot() : uint8(NULL_SLOT)),
+          session(value->GetSession() ? value->GetSession()->GetPartySessionIncarnation() : 0),
+          inventoryItem(item && value->GetItemByGuid(itemGuid) == item), wasInWorld(value->IsInWorld()) { }
+    bool Refresh(Item*& item) const
+    {
+        if ((wasInWorld && ObjectAccessor::FindPlayer(playerGuid) != player) ||
+            (player->GetSession() ? player->GetSession()->GetPartySessionIncarnation() : 0) != session) return false;
+        if (!inventoryItem) return true; // Empty mail and detached native probes have no inventory instance.
+        Item* current = player->GetItemByGuid(itemGuid);
+        if (!current || current->GetOwnerGUID() != playerGuid || current->GetBagSlot() != bag ||
+            current->GetSlot() != slot) return false;
+        item = current;
+        return true;
+    }
+};
+}
+// PARTY_NATIVE_ITEM_HOOK_STATE_END
 
 void ScriptMgr::OnPlayerBeforeDurabilityRepair(Player* player, ObjectGuid npcGUID, ObjectGuid itemGUID, float& discountMod, uint8 guildBank)
 {
@@ -37,8 +78,44 @@ void ScriptMgr::OnPlayerGossipSelectCode(Player* player, uint32 menu_id, uint32 
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_GOSSIP_SELECT_CODE, script->OnPlayerGossipSelectCode(player, menu_id, sender, action, code));
 }
 
+namespace
+{
+thread_local NativeQuestLifecycleContext CurrentQuestLifecycleContext;
+thread_local ScopedNativeQuestLifecycleContext* CurrentQuestLifecycleScope = nullptr;
+std::atomic<uint64> QuestLifecycleDispatchSequence{0};
+}
+ScopedNativeQuestLifecycleContext::ScopedNativeQuestLifecycleContext(Player* actor, uint32 hookId, uint32 questId) noexcept
+    : previous(CurrentQuestLifecycleContext), previousScope(CurrentQuestLifecycleScope)
+{
+    current.active = actor != nullptr; current.hookId = hookId; current.questId = questId;
+    current.dispatchSequence = ++QuestLifecycleDispatchSequence;
+    if (actor)
+    {
+        current.actorGuid = actor->GetGUID().GetRawValue();
+        if (auto* session = actor->GetSession())
+        {
+            current.accountId = session->GetAccountId();
+            current.sessionIncarnation = session->GetPartySessionIncarnation();
+        }
+    }
+    CurrentQuestLifecycleContext = current;
+    CurrentQuestLifecycleScope = this;
+}
+ScopedNativeQuestLifecycleContext::~ScopedNativeQuestLifecycleContext() noexcept
+{
+    CurrentQuestLifecycleContext = previous;
+    CurrentQuestLifecycleScope = previousScope;
+}
+NativeQuestLifecycleContext ScriptMgr::ReadQuestLifecycleContext(uint32 depth) const noexcept
+{
+    auto const* scope = CurrentQuestLifecycleScope;
+    while (scope && depth) { scope = scope->previousScope; --depth; }
+    return scope ? scope->current : NativeQuestLifecycleContext{};
+}
+
 void ScriptMgr::OnPlayerCompleteQuest(Player* player, Quest const* quest)
 {
+    ScopedNativeQuestLifecycleContext observationContext(player, PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST, quest ? quest->GetQuestId() : 0);
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_PLAYER_COMPLETE_QUEST, script->OnPlayerCompleteQuest(player, quest));
 }
 
@@ -54,6 +131,7 @@ void ScriptMgr::OnPlayerBattlegroundDesertion(Player* player, BattlegroundDesert
 
 void ScriptMgr::OnPlayerJustDied(Player* player)
 {
+    ScopedNativeQuestLifecycleContext observationContext(player, PLAYERHOOK_ON_PLAYER_JUST_DIED, 0);
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_PLAYER_JUST_DIED, script->OnPlayerJustDied(player));
 }
 
@@ -237,6 +315,7 @@ void ScriptMgr::OnPlayerAfterUpdate(Player* player, uint32 p_time)
 
 void ScriptMgr::OnPlayerUpdate(Player* player, uint32 p_time)
 {
+    ScopedNativeQuestLifecycleContext observationContext(player, PLAYERHOOK_ON_UPDATE, 0);
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_UPDATE, script->OnPlayerUpdate(player, p_time));
 }
 
@@ -264,6 +343,7 @@ void ScriptMgr::OnPlayerBeforeLogout(Player* player)
 
 void ScriptMgr::OnPlayerLogout(Player* player)
 {
+    ScopedNativeQuestLifecycleContext observationContext(player, PLAYERHOOK_ON_LOGOUT, 0);
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_LOGOUT, script->OnPlayerLogout(player));
 }
 
@@ -304,6 +384,7 @@ void ScriptMgr::OnPlayerUpdateArea(Player* player, uint32 oldArea, uint32 newAre
 
 bool ScriptMgr::OnPlayerBeforeTeleport(Player* player, uint32 mapid, float x, float y, float z, float orientation, uint32 options, Unit* target)
 {
+    ScopedNativeQuestLifecycleContext observationContext(player, PLAYERHOOK_ON_BEFORE_TELEPORT);
     CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_ON_BEFORE_TELEPORT, !script->OnPlayerBeforeTeleport(player, mapid, x, y, z, orientation, options, target));
 }
 
@@ -424,7 +505,91 @@ void ScriptMgr::OnPlayerCreateItem(Player* player, Item* item, uint32 count)
 
 void ScriptMgr::OnPlayerQuestRewardItem(Player* player, Item* item, uint32 count)
 {
+    ScopedNativeQuestLifecycleContext observationContext(player, PLAYERHOOK_ON_QUEST_REWARD_ITEM, 0);
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_QUEST_REWARD_ITEM, script->OnPlayerQuestRewardItem(player, item, count));
+}
+
+namespace
+{
+struct PendingQuestRewardMail
+{
+    TransactionCallback callback;
+    std::vector<NativeQuestRewardObservation> observations;
+    PendingQuestRewardMail(TransactionCallback&& value, std::vector<NativeQuestRewardObservation>&& values) noexcept
+        : callback(std::move(value)), observations(std::move(values)) { }
+};
+std::list<PendingQuestRewardMail> PendingQuestRewardMails;
+std::mutex QuestRewardMailMutex;
+std::atomic<uint64> QuestRewardMailOperation{0};
+}
+uint64 ScriptMgr::NextQuestRewardMailOperation() noexcept
+{
+    return ++QuestRewardMailOperation;
+}
+void ScriptMgr::TrackQuestRewardMailTransaction(TransactionCallback&& callback,
+    std::vector<NativeQuestRewardObservation>&& observations) noexcept
+{
+    try
+    {
+        std::lock_guard<std::mutex> lock(QuestRewardMailMutex);
+        PendingQuestRewardMails.emplace_back(std::move(callback), std::move(observations));
+    }
+    catch (...)
+    {
+        // The original transaction is already enqueued: keep its outcome UNKNOWN, never resubmit or cancel it.
+        for (auto& value : observations)
+        {
+            value.deliveryPending = false; value.deliveryKnown = false; value.complete = false;
+            try { value.deliveryReason = "mail_future_tracking_lost"; } catch (...) { }
+            OnPlayerQuestRewardDestinations(value);
+        }
+    }
+}
+void ScriptMgr::PollQuestRewardMailTransactions() noexcept
+{
+    try
+    {
+        std::list<PendingQuestRewardMail> ready;
+        {
+            std::lock_guard<std::mutex> lock(QuestRewardMailMutex);
+            for (auto it = PendingQuestRewardMails.begin(); it != PendingQuestRewardMails.end(); )
+            {
+                auto current = it++;
+                bool completed = false;
+                try { completed = current->callback.m_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready; }
+                catch (...) { completed = true; } // Broken future is an explicit unknown outcome, never a permanent orphan.
+                if (completed) ready.splice(ready.end(), PendingQuestRewardMails, current);
+            }
+        }
+        for (auto& pending : ready)
+        {
+            bool success = false, known = true;
+            try { success = pending.callback.m_future.get(); } catch (...) { known = false; }
+            for (auto& value : pending.observations)
+            {
+                value.deliveryPending = false; value.deliveryKnown = known; value.transactionCommitted = known && success;
+                value.complete = known && success && value.queuedComplete;
+                try { value.deliveryReason = !known ? "mail_commit_result_unknown" : success ? "mail_transaction_committed" : "mail_transaction_failed"; } catch (...) { }
+                OnPlayerQuestRewardDestinations(value);
+            }
+        }
+    }
+    catch (...) { } // Pending values/futures remain owned for the next world tick.
+}
+
+bool ScriptMgr::ShouldObserveQuestReward(uint64 actorGuid, uint32 accountId, uint64 session, uint32 questId) noexcept
+{
+    // Reuse only the existing destination listeners; no new hook registry or actor callbacks.
+    for (auto* script : ScriptRegistry<PlayerScript>::EnabledHooks[PLAYERHOOK_ON_QUEST_REWARD_DESTINATIONS])
+        try { if (script->ShouldObserveQuestReward(actorGuid, accountId, session, questId)) return true; } catch (...) { }
+    return false;
+}
+
+void ScriptMgr::OnPlayerQuestRewardDestinations(NativeQuestRewardObservation const& observation) noexcept
+{
+    // Observation failure must never cancel or modify the ordinary earned reward.
+    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_QUEST_REWARD_DESTINATIONS,
+        try { script->OnPlayerQuestRewardDestinations(observation); } catch (...) { });
 }
 
 bool ScriptMgr::OnPlayerCanPlaceAuctionBid(Player* player, AuctionEntry* auction)
@@ -559,12 +724,25 @@ bool ScriptMgr::OnPlayerCanGroupAccept(Player* player, Group* group)
 
 bool ScriptMgr::OnPlayerCanSellItem(Player* player, Item* item, Creature* creature)
 {
-    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_SELL_ITEM, !script->OnPlayerCanSellItem(player, item, creature));
+    if (!player || !item || !creature) return false;
+    NativeItemHookState state(player, item);
+    ObjectGuid const vendorGuid = creature->GetGUID();
+    for (auto const& script : ScriptRegistry<PlayerScript>::EnabledHooks[PLAYERHOOK_CAN_SELL_ITEM])
+    {
+        if (!state.Refresh(item)) return false;
+        creature = player->GetNPCIfCanInteractWith(vendorGuid, UNIT_NPC_FLAG_VENDOR);
+        if (!creature || !script->OnPlayerCanSellItem(player, item, creature)) return false;
+    }
+    return state.Refresh(item);
 }
 
 bool ScriptMgr::OnPlayerCanSendMail(Player* player, ObjectGuid receiverGuid, ObjectGuid mailbox, std::string& subject, std::string& body, uint32 money, uint32 COD, Item* item)
 {
-    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_SEND_MAIL, !script->OnPlayerCanSendMail(player, receiverGuid, mailbox, subject, body, money, COD, item));
+    if (!player) return false;
+    NativeItemHookState state(player, item);
+    for (auto const& script : ScriptRegistry<PlayerScript>::EnabledHooks[PLAYERHOOK_CAN_SEND_MAIL])
+        if (!state.Refresh(item) || !script->OnPlayerCanSendMail(player, receiverGuid, mailbox, subject, body, money, COD, item)) return false;
+    return state.Refresh(item);
 }
 
 bool ScriptMgr::OnPlayerCanSendErrorAlreadyLooted(Player* player)
@@ -724,7 +902,16 @@ bool ScriptMgr::OnPlayerCanCastItemCombatSpell(Player* player, Unit* target, Wea
 
 bool ScriptMgr::OnPlayerCanCastItemUseSpell(Player* player, Item* item, SpellCastTargets const& targets, uint8 cast_count, uint32 glyphIndex)
 {
-    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_CAST_ITEM_USE_SPELL, !script->OnPlayerCanCastItemUseSpell(player, item, targets, cast_count, glyphIndex));
+    if (!player || !item) return false;
+    NativeItemHookState state(player, item);
+    SpellCastTargets currentTargets = targets;
+    for (auto const& script : ScriptRegistry<PlayerScript>::EnabledHooks[PLAYERHOOK_CAN_CAST_ITEM_USE_SPELL])
+    {
+        if (!state.Refresh(item)) return false;
+        currentTargets.Update(player);
+        if (!script->OnPlayerCanCastItemUseSpell(player, item, currentTargets, cast_count, glyphIndex)) return false;
+    }
+    return state.Refresh(item);
 }
 
 void ScriptMgr::OnPlayerApplyAmmoBonuses(Player* player, ItemTemplate const* proto, float& currentAmmoDPS)
@@ -734,7 +921,11 @@ void ScriptMgr::OnPlayerApplyAmmoBonuses(Player* player, ItemTemplate const* pro
 
 bool ScriptMgr::OnPlayerCanEquipItem(Player* player, uint8 slot, uint16& dest, Item* pItem, bool swap, bool not_loading)
 {
-    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_EQUIP_ITEM, !script->OnPlayerCanEquipItem(player, slot, dest, pItem, swap, not_loading));
+    if (!player || !pItem) return false;
+    NativeItemHookState state(player, pItem);
+    for (auto const& script : ScriptRegistry<PlayerScript>::EnabledHooks[PLAYERHOOK_CAN_EQUIP_ITEM])
+        if (!state.Refresh(pItem) || !script->OnPlayerCanEquipItem(player, slot, dest, pItem, swap, not_loading)) return false;
+    return state.Refresh(pItem);
 }
 
 bool ScriptMgr::OnPlayerCanUnequipItem(Player* player, uint16 pos, bool swap)
@@ -829,12 +1020,21 @@ bool ScriptMgr::OnPlayerCanEnterMap(Player* player, MapEntry const* entry, Insta
 
 bool ScriptMgr::OnPlayerCanInitTrade(Player* player, Player* target)
 {
-    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_INIT_TRADE, !script->OnPlayerCanInitTrade(player, target));
+    if (!player || !target) return false;
+    NativeItemHookState actorState(player, nullptr), targetState(target, nullptr);
+    Item* unused = nullptr;
+    for (auto const& script : ScriptRegistry<PlayerScript>::EnabledHooks[PLAYERHOOK_CAN_INIT_TRADE])
+        if (!actorState.Refresh(unused) || !targetState.Refresh(unused) || !script->OnPlayerCanInitTrade(player, target)) return false;
+    return actorState.Refresh(unused) && targetState.Refresh(unused);
 }
 
 bool ScriptMgr::OnPlayerCanSetTradeItem(Player* player, Item* tradedItem, uint8 tradeSlot)
 {
-    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_SET_TRADE_ITEM, !script->OnPlayerCanSetTradeItem(player, tradedItem, tradeSlot));
+    if (!player || !tradedItem) return false;
+    NativeItemHookState state(player, tradedItem);
+    for (auto const& script : ScriptRegistry<PlayerScript>::EnabledHooks[PLAYERHOOK_CAN_SET_TRADE_ITEM])
+        if (!state.Refresh(tradedItem) || !script->OnPlayerCanSetTradeItem(player, tradedItem, tradeSlot)) return false;
+    return state.Refresh(tradedItem);
 }
 
 void ScriptMgr::OnPlayerSetServerSideVisibility(Player* player, ServerSideVisibilityType& type, AccountTypes& sec)
@@ -899,6 +1099,7 @@ void ScriptMgr::OnPlayerLeaveCombat(Player* player)
 
 void ScriptMgr::OnPlayerQuestAbandon(Player* player, uint32 questId)
 {
+    ScopedNativeQuestLifecycleContext observationContext(player, PLAYERHOOK_ON_QUEST_ABANDON, questId);
     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_QUEST_ABANDON, script->OnPlayerQuestAbandon(player, questId));
 }
 

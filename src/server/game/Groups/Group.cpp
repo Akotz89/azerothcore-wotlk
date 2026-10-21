@@ -16,6 +16,7 @@
  */
 
 #include "Group.h"
+#include "LootReceipt.h"
 #include "AreaDefines.h"
 #include "Battleground.h"
 #include "BattlegroundMgr.h"
@@ -57,6 +58,8 @@ Roll::~Roll()
 void Roll::setLoot(Loot* pLoot)
 {
     link(pLoot, this);
+    LootReceipt::Emit("loot_v1 roll_source roll_guid={} generation={} corpse={}",
+        itemGUID.GetRawValue(), pLoot->receiptGeneration, pLoot->sourceWorldObjectGUID.GetRawValue());
 }
 
 Loot* Roll::getLoot()
@@ -64,11 +67,14 @@ Loot* Roll::getLoot()
     return getTarget();
 }
 
-static void SendRollWonItemViaMail(Player* player, LootItem const* lootItem, uint32 itemId)
+static void SendRollWonItemViaMail(Player* player, LootItem const* lootItem, uint32 itemId, uint64 receiptOp)
 {
     Item* mailItem = Item::CreateItem(itemId, lootItem->count, player, false, lootItem->randomPropertyId);
     if (!mailItem)
+    {
+        LootReceipt::Emit("loot_v1 roll_mail op={} reason=create_failed", receiptOp);
         return;
+    }
 
     AllowedLooterSet looters = lootItem->GetAllowedLooters();
     ItemTemplate const* proto = mailItem->GetTemplate();
@@ -95,7 +101,11 @@ static void SendRollWonItemViaMail(Player* player, LootItem const* lootItem, uin
         CharacterDatabase.Execute(stmt);
     }
 
+    LootReceipt::Emit("loot_v1 roll_mail op={} reason=submit_pending guid={} owner={} entry={} count={} property={} suffix={}",
+        receiptOp, mailItem->GetGUID().GetRawValue(), mailItem->GetOwnerGUID().GetRawValue(), mailItem->GetEntry(),
+        mailItem->GetCount(), mailItem->GetItemRandomPropertyId(), mailItem->GetItemSuffixFactor());
     player->SendItemRetrievalMail(mailItem);
+    LootReceipt::Emit("loot_v1 roll_mail op={} reason=submit_returned", receiptOp);
 }
 
 Group::Group() : m_leaderName(""), m_groupType(GROUPTYPE_NORMAL),
@@ -1599,6 +1609,7 @@ void Group::CountTheRoll(Rolls::iterator rollI)
     Roll* roll = *rollI;
     if (!roll->isValid())                                   // is loot already deleted ?
     {
+        LootReceipt::Emit("loot_v1 roll_invalid op={} item_guid={}", LootReceipt::Next(), roll->itemGUID.GetRawValue());
         RollId.erase(rollI);
         delete roll;
         return;
@@ -1645,6 +1656,8 @@ void Group::CountTheRoll(Rolls::iterator rollI)
 
                     ItemPosCountVec dest;
                     LootItem* item = &(roll->itemSlot >= roll->getLoot()->items.size() ? roll->getLoot()->quest_items[roll->itemSlot - roll->getLoot()->items.size()] : roll->getLoot()->items[roll->itemSlot]);
+                    LootReceipt::Award receipt("need", roll->getLoot(), item, player, roll->itemSlot);
+                    LootReceipt::Emit("loot_v1 roll_award op={} roll_guid={}", receipt.id, roll->itemGUID.GetRawValue());
                     InventoryResult msg = player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, roll->itemid, item->count);
                     if (msg == EQUIP_ERR_OK)
                     {
@@ -1652,10 +1665,14 @@ void Group::CountTheRoll(Rolls::iterator rollI)
                         roll->getLoot()->NotifyItemRemoved(roll->itemSlot);
                         roll->getLoot()->unlootedCount--;
                         AllowedLooterSet looters = item->GetAllowedLooters();
+                        LootReceipt::Destinations(receipt.id, "before", player, dest);
                         Item* _item = player->StoreNewItem(dest, roll->itemid, true, item->randomPropertyId, looters);
+                        LootReceipt::Destinations(receipt.id, "stored", player, dest);
                         if (_item)
                             sScriptMgr->OnPlayerGroupRollRewardItem(player, _item, item->count, NEED, roll);
                         player->UpdateLootAchievements(item, roll->getLoot());
+                        LootReceipt::Destinations(receipt.id, "after_hooks", player, dest);
+                        receipt.End("native_consumed", uint32(msg));
                     }
                     else
                     {
@@ -1668,12 +1685,14 @@ void Group::CountTheRoll(Rolls::iterator rollI)
                             roll->getLoot()->NotifyItemRemoved(roll->itemSlot);
                             roll->getLoot()->unlootedCount--;
                             player->SendEquipError(msg, nullptr, nullptr, roll->itemid);
-                            SendRollWonItemViaMail(player, item, roll->itemid);
+                            SendRollWonItemViaMail(player, item, roll->itemid, receipt.id);
+                            receipt.End("mail_attempt_not_durable", uint32(msg));
                         }
                         else
                         {
                             item->is_blocked = false;
                             item->rollWinnerGUID = player->GetGUID();
+                            receipt.End("retained_winner", uint32(msg));
                             player->SendEquipError(msg, nullptr, nullptr, roll->itemid);
                         }
                     }
@@ -1725,6 +1744,8 @@ void Group::CountTheRoll(Rolls::iterator rollI)
                     player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_ROLL_GREED_ON_LOOT, roll->itemid, maxresul);
 
                     LootItem* item = &(roll->itemSlot >= roll->getLoot()->items.size() ? roll->getLoot()->quest_items[roll->itemSlot - roll->getLoot()->items.size()] : roll->getLoot()->items[roll->itemSlot]);
+                    LootReceipt::Award receipt("greed_or_disenchant", roll->getLoot(), item, player, roll->itemSlot);
+                    LootReceipt::Emit("loot_v1 roll_award op={} roll_guid={}", receipt.id, roll->itemGUID.GetRawValue());
 
                     if (rollvote == GREED)
                     {
@@ -1736,10 +1757,14 @@ void Group::CountTheRoll(Rolls::iterator rollI)
                             roll->getLoot()->NotifyItemRemoved(roll->itemSlot);
                             roll->getLoot()->unlootedCount--;
                             AllowedLooterSet looters = item->GetAllowedLooters();
-                            Item* _item = player->StoreNewItem(dest, roll->itemid, true, item->randomPropertyId, looters);
-                            if (_item)
+                            LootReceipt::Destinations(receipt.id, "before", player, dest);
+                        Item* _item = player->StoreNewItem(dest, roll->itemid, true, item->randomPropertyId, looters);
+                            LootReceipt::Destinations(receipt.id, "stored", player, dest);
+                        if (_item)
                                 sScriptMgr->OnPlayerGroupRollRewardItem(player, _item, item->count, GREED, roll);
                             player->UpdateLootAchievements(item, roll->getLoot());
+                        LootReceipt::Destinations(receipt.id, "after_hooks", player, dest);
+                        receipt.End("native_consumed", uint32(msg));
                         }
                         else
                         {
@@ -1752,18 +1777,26 @@ void Group::CountTheRoll(Rolls::iterator rollI)
                                 roll->getLoot()->NotifyItemRemoved(roll->itemSlot);
                                 roll->getLoot()->unlootedCount--;
                                 player->SendEquipError(msg, nullptr, nullptr, roll->itemid);
-                                SendRollWonItemViaMail(player, item, roll->itemid);
+                                SendRollWonItemViaMail(player, item, roll->itemid, receipt.id);
+                            receipt.End("mail_attempt_not_durable", uint32(msg));
                             }
                             else
                             {
                                 item->is_blocked = false;
                                 item->rollWinnerGUID = player->GetGUID();
+                            receipt.End("retained_winner", uint32(msg));
                                 player->SendEquipError(msg, nullptr, nullptr, roll->itemid);
                             }
                         }
                     }
                     else if (rollvote == DISENCHANT)
                     {
+                        uint64 const transformOp = LootReceipt::Next();
+                        LootReceipt::Disenchant::Link transformLink{transformOp, roll->getLoot()->receiptGeneration,
+                            roll->getLoot()->sourceWorldObjectGUID.GetRawValue(), player->GetGUID().GetRawValue()};
+                        LootReceipt::Emit("loot_v2 transform_begin op={} parent={} generation={} corpse={} actor={} slot={} entry={} count={}",
+                            transformOp, receipt.id, transformLink.generation, transformLink.corpse, transformLink.actor,
+                            roll->itemSlot, item->itemid, item->count);
                         item->is_looted = true;
                         roll->getLoot()->NotifyItemRemoved(roll->itemSlot);
                         roll->getLoot()->unlootedCount--;
@@ -1775,21 +1808,34 @@ void Group::CountTheRoll(Rolls::iterator rollI)
 
                         if (msg == EQUIP_ERR_OK)
                         {
+                            LootReceipt::Disenchant::Scope dispatch(LootReceipt::Disenchant::Call::AutoStore,
+                                &LootTemplates_Disenchant, transformLink, pProto->DisenchantID);
                             player->AutoStoreLoot(pProto->DisenchantID, LootTemplates_Disenchant, true);
                         }
                         else
                         {
                             Loot loot;
+                            LootReceipt::Disenchant::GeneratedScope generated(&loot, transformLink);
                             loot.FillLoot(pProto->DisenchantID, LootTemplates_Disenchant, player, true);
 
                             uint32 max_slot = loot.GetMaxSlotInLootFor(player);
                             for(uint32 i = 0; i < max_slot; i++)
                             {
-                                LootItem* lootItem = loot.LootItemInSlot(i, player);
+                                QuestItem* receiptQuest = nullptr;
+                                LootItem* lootItem = loot.LootItemInSlot(i, player, &receiptQuest);
                                 player->SendEquipError(msg, nullptr, nullptr, lootItem->itemid);
+                                uint64 const outputOp = LootReceipt::Next();
+                                LootReceipt::Emit("loot_v2 output_begin op={} parent={} route=generated_mail slot={} entry={} count={} property={} domain={} source_index={}",
+                                    outputOp, transformOp, i, lootItem->itemid, lootItem->count, lootItem->randomPropertyId,
+                                    receiptQuest ? "quest" : "normal", receiptQuest ? receiptQuest->index : i);
+                                LootReceipt::Disenchant::Link outputLink{outputOp, transformLink.generation, transformLink.corpse, transformLink.actor};
+                                LootReceipt::Disenchant::Scope retrieval(LootReceipt::Disenchant::Call::Retrieval, player, outputLink);
                                 player->SendItemRetrievalMail(lootItem->itemid, lootItem->count);
+                                LootReceipt::Emit("loot_v2 output_end op={} reason=retrieval_returned_not_durable", outputOp);
                             }
                         }
+                        LootReceipt::Emit("loot_v2 transform_end op={} reason=native_dispatch_returned error={}", transformOp, uint32(msg));
+                        receipt.End("disenchant_native_dispatch_returned", uint32(msg));
                     }
                 }
             }
@@ -1804,7 +1850,12 @@ void Group::CountTheRoll(Rolls::iterator rollI)
         // remove is_blocked so that the item is lootable by all players
         LootItem* item = &(roll->itemSlot >= roll->getLoot()->items.size() ? roll->getLoot()->quest_items[roll->itemSlot - roll->getLoot()->items.size()] : roll->getLoot()->items[roll->itemSlot]);
         if (item)
+        {
             item->is_blocked = false;
+            LootReceipt::Emit("loot_v1 roll_passed op={} generation={} corpse={} slot={} entry={} count={} consumed={} blocked={}",
+                LootReceipt::Next(), roll->getLoot()->receiptGeneration, roll->getLoot()->sourceWorldObjectGUID.GetRawValue(),
+                roll->itemSlot, item->itemid, item->count, item->is_looted, item->is_blocked);
+        }
     }
 
     if (Loot* loot = roll->getLoot(); loot && loot->isLooted() && loot->sourceGameObject)

@@ -24,6 +24,7 @@
 #include <map>
 
 struct AuctionEntry;
+struct NativeQuestRewardMailEnvelope;
 struct CalendarEvent;
 class Item;
 class Object;
@@ -140,8 +141,15 @@ public:                                                 // modifiers
 public:                                                 // finishers
     void SendReturnToSender(uint32 sender_acc, ObjectGuid::LowType sender_guid, ObjectGuid::LowType receiver_guid, CharacterDatabaseTransaction trans);
     void SendMailTo(CharacterDatabaseTransaction trans, MailReceiver const& receiver, MailSender const& sender, MailCheckMask checked = MAIL_CHECK_MASK_NONE, uint32 deliver_delay = 0, uint32 custom_expiration = 0, bool deleteMailItemsFromDB = false, bool sendMail = true);
+    bool TrySendMailTo(CharacterDatabaseTransaction trans, MailReceiver const& receiver, MailSender const& sender, MailCheckMask checked = MAIL_CHECK_MASK_NONE, uint32 deliver_delay = 0, uint32 custom_expiration = 0, bool deleteMailItemsFromDB = false, bool sendMail = true);
+
+    bool TrySendMailToObserved(CharacterDatabaseTransaction trans, MailReceiver const& receiver, MailSender const& sender,
+        NativeQuestRewardMailEnvelope& observation);
 
 private:
+    bool _TrySendMailTo(CharacterDatabaseTransaction trans, MailReceiver const& receiver, MailSender const& sender,
+        MailCheckMask checked, uint32 deliver_delay, uint32 custom_expiration, bool deleteMailItemsFromDB, bool sendMail,
+        NativeQuestRewardMailEnvelope* observation);
     void deleteIncludedItems(CharacterDatabaseTransaction trans, bool inDB = false);
     void prepareItems(Player* receiver, CharacterDatabaseTransaction trans);                // called from SendMailTo for generate mailTemplateBase items
 

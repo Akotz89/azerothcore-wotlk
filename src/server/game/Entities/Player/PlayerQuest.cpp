@@ -25,6 +25,11 @@
 #include "Group.h"
 #include "MapMgr.h"
 #include "Player.h"
+#include <optional>
+#include <string_view>
+#include <unordered_set>
+#include "ObjectAccessor.h"
+#include "Item.h"
 #include "PoolMgr.h"
 #include "QuestPackets.h"
 #include "ReputationMgr.h"
@@ -36,6 +41,20 @@
 /*********************************************************/
 /***                    QUEST SYSTEM                   ***/
 /*********************************************************/
+
+Player::GuardedVendorNotification::GuardedVendorNotification(Player* player,
+    std::function<Player*()> const& resolver, ObjectGuid guid, uint32 entry)
+    : actor(player), previous(player->_guardedVendorNotification), locate(resolver), itemGuid(guid), actorGuid(player->GetGUID()), itemEntry(entry)
+{
+    player->_guardedVendorNotification = this;
+}
+
+Player::GuardedVendorNotification::~GuardedVendorNotification()
+{
+    // Detach from the same live actor even when teleport/session drift invalidated the purchase resolver.
+    if (Player* live = ObjectAccessor::FindConnectedPlayer(actorGuid); live == actor && live->_guardedVendorNotification == this)
+        live->_guardedVendorNotification = previous;
+}
 
 void Player::PrepareQuestMenu(ObjectGuid guid)
 {
@@ -254,7 +273,12 @@ bool Player::CanSeeStartQuest(Quest const* quest)
 
 bool Player::CanTakeQuest(Quest const* quest, bool msg)
 {
-    return sScriptMgr->OnPlayerCanAcceptQuest(this, quest)
+    auto const* notification = _guardedVendorNotification;
+    uint32 const questId = quest->GetQuestId();
+    bool accepted = sScriptMgr->OnPlayerCanAcceptQuest(this, quest);
+    if (notification && (notification->locate() != this || sObjectMgr->GetQuestTemplate(questId) != quest))
+        return false;
+    return accepted
            && !sDisableMgr->IsDisabledFor(DISABLE_TYPE_QUEST, quest->GetQuestId(), this)
            && SatisfyQuestStatus(quest, msg) && SatisfyQuestExclusiveGroup(quest, msg)
            && SatisfyQuestClass(quest, msg) && SatisfyQuestRace(quest, msg) && SatisfyQuestLevel(quest, msg)
@@ -297,22 +321,37 @@ bool Player::CanAddQuest(Quest const* quest, bool msg)
 
 bool Player::CanCompleteQuest(uint32 quest_id, QuestStatusData const* q_savedStatus)
 {
+    auto const* notification = _guardedVendorNotification;
+    QuestStatusData savedStatus;
+    if (notification && q_savedStatus) { savedStatus = *q_savedStatus; q_savedStatus = &savedStatus; }
+    uint16 const originalSlot = notification ? FindQuestSlot(quest_id) : 0;
+    QuestStatus const originalStatus = notification ? GetQuestStatus(quest_id) : QUEST_STATUS_NONE;
     if (quest_id)
     {
         Quest const* qInfo = sObjectMgr->GetQuestTemplate(quest_id);
         if (!qInfo)
             return false;
 
-        if (!sScriptMgr->OnPlayerCanProgressQuestObjective(this, qInfo))
-            return false;
+        bool allowed = sScriptMgr->OnPlayerCanProgressQuestObjective(this, qInfo);
+        auto current = [&]()
+        {
+            return !notification || (notification->locate() == this &&
+                sObjectMgr->GetQuestTemplate(quest_id) == qInfo && FindQuestSlot(quest_id) == originalSlot &&
+                GetQuestStatus(quest_id) == originalStatus);
+        };
+        if (!current() || !allowed) return false;
 
         // Xinef: take seasonals into account
         if (!qInfo->IsRepeatable() && !qInfo->IsSeasonal() && IsQuestRewarded(quest_id))
             return false;                                   // not allow re-complete quest
 
         // auto complete quest
-        if ((qInfo->IsAutoComplete() || !qInfo->GetQuestMethod()) && CanTakeQuest(qInfo, false))
-            return true;
+        if (qInfo->IsAutoComplete() || !qInfo->GetQuestMethod())
+        {
+            bool take = CanTakeQuest(qInfo, false);
+            if (!current()) return false;
+            if (take) return true;
+        }
 
         QuestStatusData q_status;
         if (q_savedStatus)
@@ -332,6 +371,9 @@ bool Player::CanCompleteQuest(uint32 quest_id, QuestStatusData const* q_savedSta
             {
                 for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; i++)
                 {
+                    if (notification && qInfo->RequiredItemId[i] == notification->itemEntry &&
+                        GetItemCount(notification->itemEntry, false) < qInfo->RequiredItemCount[i])
+                        return false;
                     if (qInfo->RequiredItemCount[i] != 0 && q_status.ItemCount[i] < qInfo->RequiredItemCount[i])
                         return false;
                 }
@@ -435,15 +477,38 @@ bool Player::CanRewardQuest(Quest const* quest, bool msg)
 
 void Player::AddQuestAndCheckCompletion(Quest const* quest, Object* questGiver)
 {
+    ObjectGuid const playerGuid = GetGUID();
+    uint64 const session = GetSession() ? GetSession()->GetPartySessionIncarnation() : 0;
+    bool const wasInWorld = IsInWorld();
+    bool const itemGiver = questGiver && (questGiver->GetTypeId() == TYPEID_ITEM || questGiver->GetTypeId() == TYPEID_CONTAINER);
+    ObjectGuid const itemGuid = itemGiver ? questGiver->GetGUID() : ObjectGuid::Empty;
+    uint8 const originalBag = itemGiver ? static_cast<Item*>(questGiver)->GetBagSlot() : uint8(NULL_BAG);
+    uint8 const originalSlot = itemGiver ? static_cast<Item*>(questGiver)->GetSlot() : uint8(NULL_SLOT);
+    auto refreshItemGiver = [&]()
+    {
+        if ((wasInWorld && ObjectAccessor::FindPlayer(playerGuid) != this) ||
+            (GetSession() ? GetSession()->GetPartySessionIncarnation() : 0) != session ||
+            (GetSession() && GetSession()->isLogingOut())) return false;
+        if (!itemGiver) return true;
+        Item* current = GetItemByGuid(itemGuid);
+        if (!current || current->GetOwnerGUID() != playerGuid || current->GetBagSlot() != originalBag ||
+            current->GetSlot() != originalSlot) return false;
+        questGiver = current;
+        return true;
+    };
     if (!sScriptMgr->OnPlayerCanAcceptQuest(this, quest))
         return;
 
+    if (!refreshItemGiver() || (GetSession() && !GetSession()->IsNativeMutationAuthorized())) return;
     AddQuest(quest, questGiver);
+    if (!refreshItemGiver() || GetQuestStatus(quest->GetQuestId()) == QUEST_STATUS_NONE) return;
     sScriptMgr->OnPlayerQuestAccept(this, quest);
+    if (!refreshItemGiver()) return;
 
     if (CanCompleteQuest(quest->GetQuestId()))
         CompleteQuest(quest->GetQuestId());
 
+    if (!refreshItemGiver()) return;
     if (!questGiver)
         return;
 
@@ -458,6 +523,8 @@ void Player::AddQuestAndCheckCompletion(Quest const* quest, Object* questGiver)
         {
             Item* item = (Item*)questGiver;
             sScriptMgr->OnQuestAccept(this, item, quest);
+            if (!refreshItemGiver()) return;
+            item = static_cast<Item*>(questGiver);
 
             // destroy not required for quest finish quest starting item
             bool destroyItem = true;
@@ -535,8 +602,25 @@ bool Player::CanRewardQuest(Quest const* quest, uint32 reward, bool msg)
 
 void Player::AddQuest(Quest const* quest, Object* questGiver)
 {
+    ObjectGuid const playerGuid = GetGUID();
+    uint64 const session = GetSession() ? GetSession()->GetPartySessionIncarnation() : 0;
+    bool const wasInWorld = IsInWorld();
+    bool const itemGiver = questGiver && (questGiver->GetTypeId() == TYPEID_ITEM || questGiver->GetTypeId() == TYPEID_CONTAINER);
+    ObjectGuid const itemGuid = itemGiver ? questGiver->GetGUID() : ObjectGuid::Empty;
+    uint8 const originalBag = itemGiver ? static_cast<Item*>(questGiver)->GetBagSlot() : uint8(NULL_BAG);
+    uint8 const originalSlot = itemGiver ? static_cast<Item*>(questGiver)->GetSlot() : uint8(NULL_SLOT);
     if (!sScriptMgr->OnPlayerCanAcceptQuest(this, quest))
         return;
+    if ((wasInWorld && ObjectAccessor::FindPlayer(playerGuid) != this) ||
+        (GetSession() ? GetSession()->GetPartySessionIncarnation() : 0) != session ||
+        (GetSession() && (GetSession()->isLogingOut() || !GetSession()->IsNativeMutationAuthorized()))) return;
+    if (itemGiver)
+    {
+        Item* current = GetItemByGuid(itemGuid);
+        if (!current || current->GetOwnerGUID() != playerGuid || current->GetBagSlot() != originalBag ||
+            current->GetSlot() != originalSlot) return;
+        questGiver = current;
+    }
 
     uint16 log_slot = FindQuestSlot(0);
 
@@ -629,21 +713,70 @@ void Player::AddQuest(Quest const* quest, Object* questGiver)
 
 void Player::CompleteQuest(uint32 quest_id)
 {
+    _CompleteQuestGuarded(quest_id, false);
+}
+
+bool Player::_VendorQuestRequirementsMet(uint32 questId) const
+{
+    Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+    if (!quest) return false;
+    if (quest->HasSpecialFlag(QUEST_SPECIAL_FLAGS_DELIVER))
+        for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+            if (quest->RequiredItemId[i] && GetItemCount(quest->RequiredItemId[i], false) < quest->RequiredItemCount[i])
+                return false;
+    int32 const required = quest->GetRewOrReqMoney();
+    return required >= 0 || HasEnoughMoney(uint32(-int64(required)));
+}
+
+void Player::_ReconcileVendorQuestCredit(uint32 questId)
+{
+    Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+    auto status = m_QuestStatus.find(questId);
+    if (!quest || status == m_QuestStatus.end() || FindQuestSlot(questId) >= MAX_QUEST_LOG_SIZE) return;
+    for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+    {
+        if (!quest->RequiredItemId[i]) continue;
+        uint16 const credit = uint16(std::min<uint32>(status->second.ItemCount[i], GetItemCount(quest->RequiredItemId[i], false)));
+        if (credit != status->second.ItemCount[i])
+        {
+            status->second.ItemCount[i] = credit;
+            m_QuestStatusSave[questId] = true;
+        }
+    }
+}
+
+void Player::_CompleteQuestGuarded(uint32 quest_id, bool natural)
+{
+    auto const* notification = _guardedVendorNotification;
+    uint16 const originalSlot = notification ? FindQuestSlot(quest_id) : 0;
+    QuestStatus expectedStatus = notification ? GetQuestStatus(quest_id) : QUEST_STATUS_NONE;
+    Quest const* originalTemplate = notification ? sObjectMgr->GetQuestTemplate(quest_id) : nullptr;
+    auto current = [&]()
+    {
+        return !notification || (notification->locate() == this &&
+            sObjectMgr->GetQuestTemplate(quest_id) == originalTemplate &&
+            FindQuestSlot(quest_id) == originalSlot && GetQuestStatus(quest_id) == expectedStatus &&
+            (!natural || _VendorQuestRequirementsMet(quest_id)));
+    };
     if (!quest_id)
     {
         return;
     }
 
-    if (!sScriptMgr->OnPlayerBeforeQuestComplete(this, quest_id))
+    bool before = sScriptMgr->OnPlayerBeforeQuestComplete(this, quest_id);
+    if (!current() || !before)
     {
         return;
     }
 
     Quest const* qInfo = sObjectMgr->GetQuestTemplate(quest_id);
-    if (!qInfo || !sScriptMgr->OnPlayerCanProgressQuestObjective(this, qInfo))
-        return;
+    if (!qInfo) return;
+    bool allowed = sScriptMgr->OnPlayerCanProgressQuestObjective(this, qInfo);
+    if (!current() || !allowed) return;
 
-    SetQuestStatus(quest_id, QUEST_STATUS_COMPLETE);
+    _SetQuestStatusGuarded(quest_id, QUEST_STATUS_COMPLETE, true, natural);
+    expectedStatus = QUEST_STATUS_COMPLETE;
+    if (!current()) return;
 
     auto log_slot = FindQuestSlot(quest_id);
     if (log_slot < MAX_QUEST_LOG_SIZE)
@@ -656,12 +789,15 @@ void Player::CompleteQuest(uint32 quest_id)
         // auto-rewarded, so CAIS cannot gate it here: the status is already COMPLETE above and
         // nothing re-triggers the quest, which would destroy the reward rather than defer it.
         // RewardQuest still zeroes the money and GiveXP still blocks the XP.
-        RewardQuest(qInfo, 0, this, false);
+        _RewardQuestGuarded(qInfo, 0, this, false, false, natural);
+        if (notification && notification->locate() != this) return;
     }
 
     // Xinef: area auras may change on quest completion!
     UpdateZoneDependentAuras(GetZoneId());
+    if (notification && notification->locate() != this) return;
     UpdateAreaDependentAuras(GetAreaId());
+    if (notification && notification->locate() != this) return;
     AdditionalSavingAddMask(ADDITIONAL_SAVING_INVENTORY_AND_GOLD | ADDITIONAL_SAVING_QUEST_STATUS);
 
     // check if Quest Tracker is enabled
@@ -679,6 +815,7 @@ void Player::CompleteQuest(uint32 quest_id)
 
 void Player::IncompleteQuest(uint32 quest_id)
 {
+    auto const* notification = _guardedVendorNotification;
     if (quest_id)
     {
         SetQuestStatus(quest_id, QUEST_STATUS_INCOMPLETE);
@@ -689,15 +826,111 @@ void Player::IncompleteQuest(uint32 quest_id)
 
         // Xinef: area auras may change on quest completion!
         UpdateZoneDependentAuras(GetZoneId());
+        if (notification && notification->locate() != this) return;
         UpdateAreaDependentAuras(GetAreaId());
+        if (notification && notification->locate() != this) return;
         AdditionalSavingAddMask(ADDITIONAL_SAVING_QUEST_STATUS);
     }
 }
 
+namespace
+{
+std::optional<NativeQuestRewardObservation> PrepareQuestRewardObservation(Player* player, uint32 questId,
+    std::string_view kind, uint32 index, uint32 entry, uint32 count, ItemPosCountVec const& positions) noexcept
+{
+    try
+    {
+        if (!player || !player->GetSession() || !sScriptMgr->ShouldObserveQuestReward(player->GetGUID().GetRawValue(),
+            player->GetSession()->GetAccountId(), player->GetSession()->GetPartySessionIncarnation(), questId)) return std::nullopt;
+        NativeQuestRewardObservation observation;
+        observation.actorGuid = player->GetGUID().GetRawValue(); observation.accountId = player->GetSession()->GetAccountId();
+        observation.sessionIncarnation = player->GetSession()->GetPartySessionIncarnation();
+        observation.questId = questId; observation.rewardKind = kind; observation.rewardIndex = index;
+        observation.itemEntry = entry; observation.count = count;
+        for (auto const& position : positions)
+        {
+            NativeQuestRewardDestination destination;
+            destination.bagSlot = position.pos; destination.plannedCount = position.count;
+            if (auto* item = player->GetItemByPos(position.pos))
+            {
+                destination.beforeGuid = item->GetGUID().GetRawValue(); destination.beforeEntry = item->GetEntry();
+                destination.beforeCount = item->GetCount();
+            }
+            observation.destinations.push_back(destination);
+        }
+        return observation;
+    }
+    catch (...) { return std::nullopt; }
+}
+void FinishQuestRewardObservation(Player* player, std::optional<NativeQuestRewardObservation>& observation, bool stored) noexcept
+{
+    if (!observation) return;
+    try
+    {
+        auto& value = *observation; value.complete = stored && !value.destinations.empty();
+        auto* current = ObjectAccessor::FindPlayerByLowGUID(value.actorGuid);
+        if (current != player || !current || !current->GetSession() || current->GetGUID().GetRawValue() != value.actorGuid ||
+            current->GetSession()->GetAccountId() != value.accountId ||
+            current->GetSession()->GetPartySessionIncarnation() != value.sessionIncarnation)
+        {
+            value.complete = false; value.deliveryReason = "inventory_observation_owner_changed"; return;
+        }
+        uint64 plannedSum = 0;
+        std::unordered_set<uint16> seen;
+        for (auto& destination : value.destinations)
+        {
+            plannedSum += destination.plannedCount;
+            if (!seen.insert(destination.bagSlot).second) value.complete = false;
+            if (auto* item = player->GetItemByPos(destination.bagSlot))
+            {
+                destination.itemGuid = item->GetGUID().GetRawValue(); destination.itemEntry = item->GetEntry();
+                destination.afterCount = item->GetCount();
+                bool sameStack = !destination.beforeGuid || (destination.beforeGuid == destination.itemGuid && destination.beforeEntry == value.itemEntry);
+                if (sameStack && destination.itemEntry == value.itemEntry && destination.afterCount >= destination.beforeCount)
+                    destination.delta = destination.afterCount - destination.beforeCount;
+                destination.matched = sameStack && destination.itemEntry == value.itemEntry && destination.delta == destination.plannedCount;
+            }
+            value.countSum += destination.delta;
+            if (!destination.matched) value.complete = false;
+        }
+        value.complete = value.complete && plannedSum == value.count && value.countSum == value.count;
+        value.deliveryReason = value.complete ? "inventory_all_destinations_observed" : "inventory_destination_readback_incomplete";
+    }
+    catch (...) { observation.reset(); }
+}
+}
+
 void Player::RewardQuest(Quest const* quest, uint32 reward, Object* questGiver, bool announce, bool isLFGReward)
 {
-    if (!sScriptMgr->OnPlayerCanRewardQuest(this, quest))
+    _RewardQuestGuarded(quest, reward, questGiver, announce, isLFGReward, false);
+}
+
+void Player::_RewardQuestGuarded(Quest const* quest, uint32 reward, Object* questGiver, bool announce, bool isLFGReward, bool natural)
+{
+    auto* notification = _guardedVendorNotification;
+    uint32 const originalQuestId = quest->GetQuestId();
+    uint16 const originalSlot = notification ? FindQuestSlot(originalQuestId) : 0;
+    QuestStatus const originalStatus = notification ? GetQuestStatus(originalQuestId) : QUEST_STATUS_NONE;
+    bool const originallyRewarded = notification && IsQuestRewarded(originalQuestId);
+    if (notification && !notification->rewardingQuests.insert(originalQuestId).second) return;
+    struct RewardScope
+    {
+        GuardedVendorNotification* notification;
+        uint32 questId;
+        ~RewardScope() { if (notification) notification->rewardingQuests.erase(questId); }
+    } rewardScope{notification, originalQuestId};
+    bool allowed = sScriptMgr->OnPlayerCanRewardQuest(this, quest);
+    if (notification && (notification->locate() != this ||
+        sObjectMgr->GetQuestTemplate(originalQuestId) != quest || FindQuestSlot(originalQuestId) != originalSlot ||
+        GetQuestStatus(originalQuestId) != originalStatus || IsQuestRewarded(originalQuestId) != originallyRewarded)) return;
+    if (!allowed) return;
+    if (notification && natural && !_VendorQuestRequirementsMet(originalQuestId))
+    {
+        // RemoveItem deliberately skips quest credit; reconcile this unfinished natural completion.
+        _ReconcileVendorQuestCredit(originalQuestId);
+        IncompleteQuest(originalQuestId);
         return;
+    }
 
     //this THING should be here to protect code from quest, which cast on player far teleport as a reward
     //should work fine, cause far teleport will be executed in Player::Update()
@@ -729,6 +962,21 @@ void Player::RewardQuest(Quest const* quest, uint32 reward, Object* questGiver, 
     RemoveTimedQuest(quest_id);
 
     std::vector<std::pair<uint32, uint32>> problematicItems;
+    std::optional<std::vector<NativeQuestRewardObservation>> mailObservations;
+    if (GetSession() && sScriptMgr->ShouldObserveQuestReward(GetGUID().GetRawValue(), GetSession()->GetAccountId(),
+        GetSession()->GetPartySessionIncarnation(), quest_id)) mailObservations.emplace();
+    auto observeMailRequest = [&](std::string_view kind, uint32 index, uint32 entry, uint32 count) noexcept
+    {
+        if (!mailObservations) return;
+        try
+        {
+            auto observation = PrepareQuestRewardObservation(this, quest_id, kind, index, entry, count, {});
+            if (!observation) { mailObservations.reset(); return; }
+            observation->operationId = sScriptMgr->NextQuestRewardMailOperation();
+            mailObservations->push_back(std::move(*observation));
+        }
+        catch (...) { mailObservations.reset(); }
+    };
 
     if (quest->GetRewChoiceItemsCount())
     {
@@ -737,14 +985,18 @@ void Player::RewardQuest(Quest const* quest, uint32 reward, Object* questGiver, 
             ItemPosCountVec dest;
             if (CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, quest->RewardChoiceItemCount[reward]) == EQUIP_ERR_OK)
             {
+                auto observation = PrepareQuestRewardObservation(this, quest_id, "choice", reward, itemId, quest->RewardChoiceItemCount[reward], dest);
                 Item* item = StoreNewItem(dest, itemId, true);
+                FinishQuestRewardObservation(this, observation, item != nullptr);
                 SendNewItem(item, quest->RewardChoiceItemCount[reward], true, false, false, false);
 
                 sScriptMgr->OnPlayerQuestRewardItem(this, item, quest->RewardChoiceItemCount[reward]);
+                if (observation) sScriptMgr->OnPlayerQuestRewardDestinations(*observation);
             }
             else
             {
                 problematicItems.emplace_back(itemId, quest->RewardChoiceItemCount[reward]);
+                observeMailRequest("choice", reward, itemId, quest->RewardChoiceItemCount[reward]);
             }
         }
     }
@@ -758,13 +1010,19 @@ void Player::RewardQuest(Quest const* quest, uint32 reward, Object* questGiver, 
                 ItemPosCountVec dest;
                 if (CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, quest->RewardItemIdCount[i]) == EQUIP_ERR_OK)
                 {
+                    auto observation = PrepareQuestRewardObservation(this, quest_id, "guaranteed", i, itemId, quest->RewardItemIdCount[i], dest);
                     Item* item = StoreNewItem(dest, itemId, true);
+                    FinishQuestRewardObservation(this, observation, item != nullptr);
                     SendNewItem(item, quest->RewardItemIdCount[i], true, false, false, false);
 
                     sScriptMgr->OnPlayerQuestRewardItem(this, item, quest->RewardItemIdCount[i]);
+                    if (observation) sScriptMgr->OnPlayerQuestRewardDestinations(*observation);
                 }
                 else
+                {
                     problematicItems.emplace_back(itemId, quest->RewardItemIdCount[i]);
+                    observeMailRequest("guaranteed", i, itemId, quest->RewardItemIdCount[i]);
+                }
             }
         }
     }
@@ -772,7 +1030,9 @@ void Player::RewardQuest(Quest const* quest, uint32 reward, Object* questGiver, 
     // Xinef: send items that couldn't be added properly by mail
     if (!problematicItems.empty())
     {
-        SendItemRetrievalMail(problematicItems);
+        if (mailObservations && mailObservations->size() == problematicItems.size())
+            SendQuestRewardRetrievalMail(problematicItems, std::move(*mailObservations));
+        else SendItemRetrievalMail(problematicItems);
     }
 
     RewardReputation(quest);
@@ -1577,11 +1837,23 @@ bool Player::CanShareQuest(uint32 quest_id) const
 
 void Player::SetQuestStatus(uint32 questId, QuestStatus status, bool update /*= true*/)
 {
+    _SetQuestStatusGuarded(questId, status, update, false);
+}
+
+void Player::_SetQuestStatusGuarded(uint32 questId, QuestStatus status, bool update, bool natural)
+{
+    auto const* notification = _guardedVendorNotification;
+    uint16 const originalSlot = notification ? FindQuestSlot(questId) : 0;
+    QuestStatus const originalStatus = notification ? GetQuestStatus(questId) : QUEST_STATUS_NONE;
     if (status == QUEST_STATUS_COMPLETE)
     {
         Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
-        if (!quest || !sScriptMgr->OnPlayerCanProgressQuestObjective(this, quest))
-            return;
+        if (!quest) return;
+        bool allowed = sScriptMgr->OnPlayerCanProgressQuestObjective(this, quest);
+        if (notification && (notification->locate() != this ||
+            sObjectMgr->GetQuestTemplate(questId) != quest || FindQuestSlot(questId) != originalSlot ||
+            GetQuestStatus(questId) != originalStatus)) return;
+        if (!allowed || (notification && natural && !_VendorQuestRequirementsMet(questId))) return;
     }
 
     if (Quest const* quest = sObjectMgr->GetQuestTemplate(questId))
@@ -1600,6 +1872,7 @@ void Player::SetQuestStatus(uint32 questId, QuestStatus status, bool update /*= 
 
 void Player::RemoveActiveQuest(uint32 questId, bool update /*= true*/)
 {
+    auto const* notification = _guardedVendorNotification;
     QuestStatusMap::iterator itr = m_QuestStatus.find(questId);
     if (itr != m_QuestStatus.end())
     {
@@ -1612,7 +1885,9 @@ void Player::RemoveActiveQuest(uint32 questId, bool update /*= true*/)
 
     // Xinef: area auras may change on quest remove!
     UpdateZoneDependentAuras(GetZoneId());
+    if (notification && notification->locate() != this) return;
     UpdateAreaDependentAuras(GetAreaId());
+    if (notification && notification->locate() != this) return;
     AdditionalSavingAddMask(ADDITIONAL_SAVING_QUEST_STATUS);
 }
 
@@ -1942,8 +2217,50 @@ void Player::GroupEventHappens(uint32 questId, WorldObject const* pEventObject)
         AreaExploredOrEventHappens(questId);
 }
 
+void Player::_ItemAddedQuestCheckGuarded(uint32 entry, uint32 count, GuardedVendorNotification const* notification)
+{
+    for (uint8 i = 0; i < MAX_QUEST_LOG_SIZE; ++i)
+    {
+        uint32 const questid = GetQuestSlotQuestId(i);
+        auto status = m_QuestStatus.find(questid);
+        if (!questid || status == m_QuestStatus.end() || status->second.Status != QUEST_STATUS_INCOMPLETE) continue;
+        Quest const* qInfo = sObjectMgr->GetQuestTemplate(questid);
+        if (!qInfo || !qInfo->HasSpecialFlag(QUEST_SPECIAL_FLAGS_DELIVER)) continue;
+        bool allowed = sScriptMgr->OnPlayerCanProgressQuestObjective(this, qInfo);
+        if (notification->locate() != this) return;
+        if (!allowed || GetQuestSlotQuestId(i) != questid || sObjectMgr->GetQuestTemplate(questid) != qInfo) continue;
+        for (uint8 j = 0; j < QUEST_ITEM_OBJECTIVES_COUNT; ++j)
+        {
+            status = m_QuestStatus.find(questid);
+            if (GetQuestSlotQuestId(i) != questid || status == m_QuestStatus.end() ||
+                status->second.Status != QUEST_STATUS_INCOMPLETE) break;
+            if (qInfo->RequiredItemId[j] != entry) continue;
+            uint32 const required = qInfo->RequiredItemCount[j];
+            uint32 credit = std::min<uint32>(uint32(status->second.ItemCount[j]) + count, required);
+            if (entry == notification->itemEntry) credit = std::min(credit, GetItemCount(entry, false));
+            if (status->second.ItemCount[j] != credit)
+            {
+                status->second.ItemCount[j] = uint16(credit);
+                m_QuestStatusSave[questid] = true;
+            }
+            bool complete = CanCompleteQuest(questid);
+            if (notification->locate() != this) return;
+            _ReconcileVendorQuestCredit(questid);
+            status = m_QuestStatus.find(questid);
+            if (GetQuestSlotQuestId(i) != questid || status == m_QuestStatus.end() ||
+                status->second.Status != QUEST_STATUS_INCOMPLETE || sObjectMgr->GetQuestTemplate(questid) != qInfo) break;
+            if (complete) _CompleteQuestGuarded(questid, true);
+            else AdditionalSavingAddMask(ADDITIONAL_SAVING_INVENTORY_AND_GOLD | ADDITIONAL_SAVING_QUEST_STATUS);
+            if (notification->locate() != this) return;
+            _ReconcileVendorQuestCredit(questid);
+        }
+    }
+    UpdateForQuestWorldObjects();
+}
+
 void Player::ItemAddedQuestCheck(uint32 entry, uint32 count)
 {
+    if (_guardedVendorNotification) return _ItemAddedQuestCheckGuarded(entry, count, _guardedVendorNotification);
     for (uint8 i = 0; i < MAX_QUEST_LOG_SIZE; ++i)
     {
         uint32 questid = GetQuestSlotQuestId(i);
@@ -2292,8 +2609,36 @@ void Player::TalkedToCreature(uint32 entry, ObjectGuid guid)
     }
 }
 
+void Player::_MoneyChangedGuarded(GuardedVendorNotification const* notification)
+{
+    for (uint8 i = 0; i < MAX_QUEST_LOG_SIZE; ++i)
+    {
+        uint32 const questid = GetQuestSlotQuestId(i);
+        Quest const* quest = sObjectMgr->GetQuestTemplate(questid);
+        auto status = m_QuestStatus.find(questid);
+        if (!questid || !quest || status == m_QuestStatus.end()) continue;
+        int32 const required = quest->GetRewOrReqMoney();
+        if (required >= 0) continue;
+        if (status->second.Status == QUEST_STATUS_INCOMPLETE && int32(GetMoney()) >= -required)
+        {
+            bool complete = CanCompleteQuest(questid);
+            if (notification->locate() != this) return;
+            _ReconcileVendorQuestCredit(questid);
+            status = m_QuestStatus.find(questid);
+            if (GetQuestSlotQuestId(i) == questid && sObjectMgr->GetQuestTemplate(questid) == quest &&
+                status != m_QuestStatus.end() && status->second.Status == QUEST_STATUS_INCOMPLETE &&
+                int32(GetMoney()) >= -required && complete) _CompleteQuestGuarded(questid, true);
+        }
+        else if (status->second.Status == QUEST_STATUS_COMPLETE && int32(GetMoney()) < -required)
+            IncompleteQuest(questid);
+        if (notification->locate() != this) return;
+        _ReconcileVendorQuestCredit(questid);
+    }
+}
+
 void Player::MoneyChanged(uint32 count)
 {
+    if (_guardedVendorNotification) return _MoneyChangedGuarded(_guardedVendorNotification);
     for (uint8 i = 0; i < MAX_QUEST_LOG_SIZE; ++i)
     {
         uint32 questid = GetQuestSlotQuestId(i);

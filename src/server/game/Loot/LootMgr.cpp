@@ -16,6 +16,7 @@
  */
 
 #include "LootMgr.h"
+#include "LootReceipt.h"
 #include "Containers.h"
 #include "DisableMgr.h"
 #include "Group.h"
@@ -108,6 +109,8 @@ public:
     void Verify(LootStore const& lootstore, uint32 id, uint8 group_id) const;
     void CollectLootIds(LootIdSet& set) const;
     void CheckLootRefs(LootStore const& lootstore, uint32 Id, LootIdSet* ref_set) const;
+    LootStoreItemList const* GetExplicitlyChancedItemList() const { return &ExplicitlyChanced; }
+    LootStoreItemList const* GetEqualChancedItemList() const { return &EqualChanced; }
     LootStoreItemList* GetExplicitlyChancedItemList() { return &ExplicitlyChanced; }
     LootStoreItemList* GetEqualChancedItemList() { return &EqualChanced; }
     void CopyConditions(ConditionList conditions);
@@ -561,6 +564,25 @@ bool Loot::FillLoot(uint32 lootId, LootStore const& store, Player* lootOwner, bo
     tab->Process(*this, store, lootMode, lootOwner, 0, true);          // Processing is done there, callback via Loot::AddItem()
 
     sScriptMgr->OnAfterLootTemplateProcess(this, tab, store, lootOwner, personal, noEmptyError, lootMode);
+
+    auto const generatedLink = LootReceipt::Disenchant::FromLoot(this, lootOwner->GetGUID().GetRawValue());
+    if (generatedLink.parent)
+    {
+        LootReceipt::Emit("loot_v2 generated_set parent={} generation={} corpse={} actor={} normal={} quest={}",
+            generatedLink.parent, generatedLink.generation, generatedLink.corpse, generatedLink.actor, items.size(), quest_items.size());
+        for (uint32 i = 0; i < items.size(); ++i)
+            LootReceipt::Emit("loot_v2 generated_material parent={} domain=normal index={} entry={} count={} property={}",
+                generatedLink.parent, i, items[i].itemid, items[i].count, items[i].randomPropertyId);
+        for (uint32 i = 0; i < quest_items.size(); ++i)
+            LootReceipt::Emit("loot_v2 generated_material parent={} domain=quest index={} entry={} count={} property={}",
+                generatedLink.parent, i, quest_items[i].itemid, quest_items[i].count, quest_items[i].randomPropertyId);
+    }
+    LootReceipt::Emit("loot_v1 template_items generation={} corpse={} normal={} quest={}",
+        receiptGeneration, sourceWorldObjectGUID.GetRawValue(), items.size(), quest_items.size());
+    for (uint32 i = 0; i < items.size(); ++i)
+        LootReceipt::ItemState(LootReceipt::Next(), "generated_pre_entitlement_normal", this, &items[i], lootOwner, i, "normal_vector");
+    for (uint32 i = 0; i < quest_items.size(); ++i)
+        LootReceipt::ItemState(LootReceipt::Next(), "generated_pre_entitlement_quest", this, &quest_items[i], lootOwner, i, "quest_vector");
 
     // Setting access rights for group loot case
     Group* group = lootOwner->GetGroup();
@@ -1514,6 +1536,68 @@ void LootTemplate::LootGroup::CheckLootRefs(LootStore const& lootstore, uint32 I
 //
 // --------- LootTemplate ---------
 //
+
+bool LootTemplate::HasItemForPlayer(uint32 item, Player const* player, uint16 mode) const
+{
+    return FindItemForPlayer([item](uint32 candidate) { return candidate==item; },player,mode)!=0;
+}
+uint32 LootTemplate::FindItemForPlayer(std::function<bool(uint32)> const& matches, Player const* player, uint16 mode) const
+{
+    std::set<LootTemplate const*> seen;
+    uint32 budget=4096;
+    return player && matches ? FindItemForPlayerImpl(matches,player,mode,0,seen,budget) : 0;
+}
+uint32 LootTemplate::FindItemForPlayerImpl(std::function<bool(uint32)> const& matches, Player const* player, uint16 mode, uint8 group,
+                                      std::set<LootTemplate const*>& seen, uint32& budget) const
+{
+    if (!budget || seen.size()>=16 || !seen.insert(this).second) return uint32(0);
+    auto inspect=[&](LootStoreItemList const& entries, bool equalChance)
+    {
+        for (auto entry:entries)
+        {
+            if (!budget) return uint32(0);
+            --budget;
+            if (!(entry->lootmode & mode) || (!equalChance && entry->chance<=0) ||
+                !sConditionMgr->IsObjectMeetToConditions(const_cast<Player*>(player),entry->conditions)) continue;
+            if (entry->reference)
+            {
+                auto reference=LootTemplates_Reference.GetLootFor(std::abs(entry->reference));
+                if (reference)
+                    if (uint32 found=reference->FindItemForPlayerImpl(matches,player,mode,entry->groupid,seen,budget)) return found;
+            }
+            else if (!entry->needs_quest || player->HasQuestForItem(entry->itemid))
+            {
+                auto proto=sObjectMgr->GetItemTemplate(entry->itemid);
+                if (!proto || sDisableMgr->IsDisabledFor(DISABLE_TYPE_LOOT,entry->itemid,nullptr)) continue;
+                if (proto->HasFlag2(ITEM_FLAG2_FACTION_HORDE) && player->GetTeamId(true)!=TEAM_HORDE) continue;
+                if (proto->HasFlag2(ITEM_FLAG2_FACTION_ALLIANCE) && player->GetTeamId(true)!=TEAM_ALLIANCE) continue;
+                if (matches(entry->itemid)) return entry->itemid;
+            }
+        }
+        return uint32(0);
+    };
+    uint32 found=0;
+    if (!group) found=inspect(Entries,false);
+    for (uint32 i=0;!found && i<Groups.size();++i)
+        if (Groups[i] && (!group || group==i+1))
+        {
+            // Native group rolls consume explicit chance in order, before condition filtering of awarded loot.
+            LootStoreItemList possible;
+            float total=0;
+            for(auto entry:*Groups[i]->GetExplicitlyChancedItemList())
+            {
+                if(!budget)break;
+                --budget;
+                if(!(entry->lootmode & mode) || entry->chance<=0 || (!entry->reference && !sObjectMgr->GetItemTemplate(entry->itemid)))continue;
+                if(total<100.0f)possible.push_back(entry);
+                total+=entry->chance;
+            }
+            found=inspect(possible,false);
+            if (!found && total<100.0f) found=inspect(*Groups[i]->GetEqualChancedItemList(),true);
+        }
+    seen.erase(this);
+    return found;
+}
 
 LootTemplate::~LootTemplate()
 {

@@ -445,6 +445,98 @@ UpdateResult UpdateFetcher::Update(bool const redundancyChecks,
     return UpdateResult(importedUpdates, countRecentUpdates, countArchivedUpdates);
 }
 
+
+UpdateResult UpdateFetcher::UpdateProgression(std::vector<StrictProgression::File> const& manifest,
+    std::string const& nativeIdentity, bool auditedAdoption) const
+{
+    try
+    {
+        StrictProgression::Require(_setDirectories != nullptr, "Progression directories missing");
+        for (auto const& directory : *_setDirectories)
+            StrictProgression::Require(is_directory(Path(_sourceDirectory->generic_string() + directory)), "Expected progression SQL directory missing");
+        auto available = GetFileList();
+        std::vector<StrictProgression::File> selected;
+        for (auto const& file : manifest)
+            for (auto const& directory : *_setDirectories)
+                if (("/" + file.path).compare(0, directory.size() + 1, directory + "/") == 0)
+                {
+                    selected.push_back(file);
+                    break;
+                }
+        StrictProgression::Require(available.size() == selected.size(), "Missing or unexpected progression SQL file");
+        auto actual = available.begin();
+        for (auto const& file : selected)
+        {
+            auto path = *_sourceDirectory / file.path;
+            StrictProgression::Require(actual != available.end() && actual->first.lexically_normal() == path.lexically_normal(), "Progression file/order differs from compiled manifest");
+            auto hash = ByteArrayToHexStr(Acore::Crypto::SHA1::GetDigestOf(ReadSQLUpdate(path)));
+            StrictProgression::Require(hash == file.hash, "Progression SQL content differs from compiled manifest");
+            ++actual;
+        }
+        if (selected.empty() && _setDirectories->empty())
+            return UpdateResult();
+        // SELECT COUNT distinguishes an empty ledger from a failed query. Do
+        // not bootstrap/drop/recreate the ledger for strict progression calls.
+        auto count = _retrieve("SELECT COUNT(*) FROM `updates`");
+        StrictProgression::Require(bool(count), "Progression updates ledger unavailable");
+        auto expected = count->Fetch()[0].Get<uint64>();
+        auto entries = ReceiveAppliedFiles();
+        StrictProgression::Require(entries.size() == expected, "Progression ledger read failed or duplicate names");
+        StrictProgression::Ledger ledger;
+        for (auto const& entry : entries)
+            ledger.emplace(entry.first, StrictProgression::Entry{entry.second.hash, entry.second.GetStateAsString()});
+        std::string ownedMarker;
+        auto write = [&](std::string const& name, StrictProgression::Entry const& entry)
+        {
+            if (name == StrictProgression::Marker)
+                _apply("INSERT INTO `updates` (`name`, `hash`, `state`) VALUES (\"" + name + "\", \"" + entry.hash + "\", 'MODULE')");
+            else
+                UpdateEntry({name, entry.hash, MODULE, 0});
+            auto result = _retrieve("SELECT `hash`, `state` FROM `updates` WHERE `name`='" + name + "'");
+            StrictProgression::Require(result && result->GetRowCount() == 1 && result->Fetch()[0].Get<std::string>() == entry.hash
+                && result->Fetch()[1].Get<std::string>() == entry.state, "Progression ledger write was not confirmed");
+            if (name == StrictProgression::Marker)
+            {
+                ownedMarker = entry.hash;
+                LOG_INFO("sql.updates", "Progression preapply marker acquired: {}", ownedMarker);
+            }
+        };
+        auto erase = [&](std::string const& name)
+        {
+            auto ownership = _retrieve("SELECT `hash`, `state` FROM `updates` WHERE `name`='" + name + "'");
+            StrictProgression::Require(!ownedMarker.empty() && ownership && ownership->GetRowCount() == 1
+                && ownership->Fetch()[0].Get<std::string>() == ownedMarker && ownership->Fetch()[1].Get<std::string>() == "MODULE",
+                "Progression marker ownership lost; refusing to clear");
+            _apply("DELETE FROM `updates` WHERE `name`='" + name + "' AND `hash`='" + ownedMarker + "'");
+            auto result = _retrieve("SELECT COUNT(*) FROM `updates` WHERE `name`='" + name + "'");
+            StrictProgression::Require(result && result->Fetch()[0].Get<uint64>() == 0, "Progression marker clear was not confirmed");
+        };
+        auto fresh = [&](std::string const& name) -> std::optional<StrictProgression::Entry>
+        {
+            auto count = _retrieve("SELECT COUNT(*) FROM `updates` WHERE `name`='" + name + "'");
+            StrictProgression::Require(count && count->GetRowCount() == 1, "Fresh progression ledger query failed");
+            auto rows = count->Fetch()[0].Get<uint64>();
+            StrictProgression::Require(rows <= 1, "Duplicate fresh progression completion");
+            if (!rows) return std::nullopt;
+            auto row = _retrieve("SELECT `hash`, `state` FROM `updates` WHERE `name`='" + name + "'");
+            StrictProgression::Require(row && row->GetRowCount() == 1, "Fresh progression completion read failed");
+            return StrictProgression::Entry{row->Fetch()[0].Get<std::string>(), row->Fetch()[1].Get<std::string>()};
+        };
+        auto imported = StrictProgression::Run(selected, nativeIdentity, auditedAdoption, ledger, write, erase,
+            [&](StrictProgression::File const& file)
+            {
+                LOG_INFO("sql.updates", "Progression SQL begin: marker={} file={} SHA1={} native={}",
+                    ownedMarker, file.path, file.hash, nativeIdentity);
+                Apply(*_sourceDirectory / file.path);
+            }, manifest, fresh);
+        return UpdateResult(imported, 0, 0);
+    }
+    catch (std::exception const& error)
+    {
+        throw UpdateException(error.what());
+    }
+}
+
 uint32 UpdateFetcher::Apply(Path const& path) const
 {
     using Time = std::chrono::high_resolution_clock;

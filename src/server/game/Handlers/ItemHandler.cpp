@@ -577,21 +577,26 @@ void WorldSession::HandleReadItem(WorldPackets::Item::ReadItem& packet)
 
 void WorldSession::HandleSellItemOpcode(WorldPackets::Item::SellItem& packet)
 {
+    (void)TrySellItem(packet);
+}
+
+uint32 WorldSession::TrySellItem(WorldPackets::Item::SellItem& packet, std::function<bool()> const& authorize)
+{
     if (!packet.ItemGuid)
-        return;
+        return 0;
 
     Creature* creature = GetPlayer()->GetNPCIfCanInteractWith(packet.VendorGuid, UNIT_NPC_FLAG_VENDOR);
     if (!creature)
     {
         LOG_DEBUG("network", "WORLD: HandleSellItemOpcode - Unit ({}) not found or you can not interact with him.", packet.VendorGuid.ToString());
         _player->SendSellError(SELL_ERR_CANT_FIND_VENDOR, nullptr, packet.ItemGuid, 0);
-        return;
+        return 0;
     }
 
     if (creature->HasFlagsExtra(CREATURE_FLAG_EXTRA_NO_SELL_VENDOR))
     {
         _player->SendSellError(SELL_ERR_CANT_SELL_TO_THIS_MERCHANT, creature, packet.ItemGuid, 0);
-        return;
+        return 0;
     }
 
     // remove fake death
@@ -601,38 +606,56 @@ void WorldSession::HandleSellItemOpcode(WorldPackets::Item::SellItem& packet)
     Item* pItem = _player->GetItemByGuid(packet.ItemGuid);
     if (pItem)
     {
-        if (!sScriptMgr->OnPlayerCanSellItem(_player, pItem, creature))
+        Player* const actor = _player;
+        ObjectGuid const actorGuid = actor->GetGUID();
+        uint8 const bag = pItem->GetBagSlot(), slot = pItem->GetSlot();
+        bool allowed = sScriptMgr->OnPlayerCanSellItem(actor, pItem, creature);
+        if (_player != actor || ObjectAccessor::FindPlayer(actorGuid) != actor || actor->GetSession() != this ||
+            isLogingOut() || !actor->IsInWorld()) return 0;
+        pItem = actor->GetItemByGuid(packet.ItemGuid);
+        creature = actor->GetNPCIfCanInteractWith(packet.VendorGuid, UNIT_NPC_FLAG_VENDOR);
+        if (!pItem || pItem->GetBagSlot() != bag || pItem->GetSlot() != slot || pItem->IsInTrade() || !creature ||
+            creature->HasFlagsExtra(CREATURE_FLAG_EXTRA_NO_SELL_VENDOR)) return 0;
+        if (!allowed)
         {
             _player->SendSellError(SELL_ERR_CANT_SELL_ITEM, creature, packet.ItemGuid, 0);
-            return;
+            return 0;
         }
 
+        if (authorize && !authorize()) return 0;
+        // Eligibility recomputation may itself invoke native script hooks.
+        if (_player != actor || ObjectAccessor::FindPlayer(actorGuid) != actor || actor->GetSession() != this ||
+            isLogingOut() || !actor->IsInWorld()) return 0;
+        pItem = actor->GetItemByGuid(packet.ItemGuid);
+        creature = actor->GetNPCIfCanInteractWith(packet.VendorGuid, UNIT_NPC_FLAG_VENDOR);
+        if (!pItem || pItem->GetBagSlot() != bag || pItem->GetSlot() != slot || pItem->IsInTrade() || !creature ||
+            creature->HasFlagsExtra(CREATURE_FLAG_EXTRA_NO_SELL_VENDOR)) return 0;
         // prevent sell not owner item
         if (_player->GetGUID() != pItem->GetOwnerGUID())
         {
             _player->SendSellError(SELL_ERR_CANT_SELL_ITEM, creature, packet.ItemGuid, 0);
-            return;
+            return 0;
         }
 
         // prevent sell non empty bag by drag-and-drop at vendor's item list
         if (pItem->IsNotEmptyBag())
         {
             _player->SendSellError(SELL_ERR_CANT_SELL_ITEM, creature, packet.ItemGuid, 0);
-            return;
+            return 0;
         }
 
         // prevent sell currently looted item
         if (_player->GetLootGUID() == pItem->GetGUID())
         {
             _player->SendSellError(SELL_ERR_CANT_SELL_ITEM, creature, packet.ItemGuid, 0);
-            return;
+            return 0;
         }
 
         // prevent selling item for sellprice when the item is still refundable
         // this probably happens when right clicking a refundable item, the client sends both
         // CMSG_SELL_ITEM and CMSG_REFUND_ITEM (unverified)
         if (pItem->IsRefundable())
-            return; // Therefore, no feedback to client
+            return 0; // Therefore, no feedback to client
 
         // special case at auto sell (sell all)
         if (packet.Count == 0)
@@ -643,7 +666,7 @@ void WorldSession::HandleSellItemOpcode(WorldPackets::Item::SellItem& packet)
             if (packet.Count > pItem->GetCount())
             {
                 _player->SendSellError(SELL_ERR_CANT_SELL_ITEM, creature, packet.ItemGuid, 0);
-                return;
+                return 0;
             }
         }
 
@@ -657,7 +680,7 @@ void WorldSession::HandleSellItemOpcode(WorldPackets::Item::SellItem& packet)
                 {
                     _player->SendEquipError(EQUIP_ERR_TOO_MUCH_GOLD, nullptr, nullptr);
                     _player->SendSellError(SELL_ERR_UNK, creature, packet.ItemGuid, 0);
-                    return;
+                    return 0;
                 }
 
                 if (sWorld->getBoolConfig(CONFIG_ITEMDELETE_VENDOR))
@@ -676,7 +699,7 @@ void WorldSession::HandleSellItemOpcode(WorldPackets::Item::SellItem& packet)
                         {
                             _player->SendSellError(SELL_ERR_CANT_SELL_ITEM, creature, packet.ItemGuid, 0);
                             LOG_ERROR("network.opcode", "WORLD: HandleSellItemOpcode - Wrong item lvl {} for item {} count = {}", pProto->ItemLevel, pItem->GetEntry(), packet.Count);
-                            return;
+                            return 0;
                         }
 
                         uint32 dQualitymodEntryId = (pProto->Quality + 1) * 2;
@@ -685,7 +708,7 @@ void WorldSession::HandleSellItemOpcode(WorldPackets::Item::SellItem& packet)
                         {
                             _player->SendSellError(SELL_ERR_CANT_SELL_ITEM, creature, packet.ItemGuid, 0);
                             LOG_ERROR("network.opcode", "WORLD: HandleSellItemOpcode - Wrong dQualityModEntry {} for item {} count = {}", dQualitymodEntryId, pItem->GetEntry(), packet.Count);
-                            return;
+                            return 0;
                         }
 
                         uint32 dmultiplier = dcost->multiplier[ItemSubClassToDurabilityMultiplierId(pProto->Class, pProto->SubClass)];
@@ -709,7 +732,7 @@ void WorldSession::HandleSellItemOpcode(WorldPackets::Item::SellItem& packet)
                     {
                         LOG_ERROR("network.opcode", "WORLD: HandleSellItemOpcode - could not create clone of item {}; count = {}", pItem->GetEntry(), packet.Count);
                         _player->SendSellError(SELL_ERR_CANT_SELL_ITEM, creature, packet.ItemGuid, 0);
-                        return;
+                        return 0;
                     }
 
                     pNewItem->SetUInt32Value(ITEM_FIELD_DURABILITY, pItem->GetUInt32Value(ITEM_FIELD_DURABILITY));
@@ -735,14 +758,15 @@ void WorldSession::HandleSellItemOpcode(WorldPackets::Item::SellItem& packet)
 
                 _player->ModifyMoney(money);
                 _player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_MONEY_FROM_VENDORS, money);
+                return packet.Count;
             }
             else
                 _player->SendSellError(SELL_ERR_CANT_SELL_ITEM, creature, packet.ItemGuid, 0);
-            return;
+            return 0;
         }
     }
     _player->SendSellError(SELL_ERR_CANT_FIND_ITEM, creature, packet.ItemGuid, 0);
-    return;
+    return 0;
 }
 
 void WorldSession::HandleBuybackItem(WorldPackets::Item::BuybackItem& packet)

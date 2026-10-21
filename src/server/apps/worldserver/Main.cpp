@@ -29,6 +29,7 @@
 #include "Common.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
+#include "DBUpdater.h"
 #include "DatabaseLoader.h"
 #include "GitRevision.h"
 #include "IoContext.h"
@@ -483,7 +484,17 @@ bool StartDB()
 
     LOG_INFO("server.loading", "> Version DB world:     {}", sWorld->GetDBVersion());
 
-    sScriptMgr->OnAfterDatabasesLoaded(loader.GetUpdateFlags());
+    try
+    {
+        sScriptMgr->OnAfterDatabasesLoaded(loader.GetUpdateFlags());
+    }
+    catch (std::exception const& error)
+    {
+        LOG_ERROR("server.loading", "Database script startup failed: {}", error.what());
+        return false;
+    }
+    if (DBUpdaterUtil::GetFailedUpdateCount())
+        return false;
 
     return true;
 }

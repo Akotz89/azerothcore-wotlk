@@ -28,9 +28,12 @@ void PlayerbotsDatabaseConnection::DoPrepareStatements()
     PrepareStatement(PLAYERBOTS_SEL_CUSTOM_STRATEGY_BY_OWNER, "SELECT DISTINCT name FROM playerbots_custom_strategy WHERE owner = ?", CONNECTION_SYNCH);
     PrepareStatement(PLAYERBOTS_SEL_CUSTOM_STRATEGY_BY_OWNER_AND_NAME, "SELECT idx, action_line FROM playerbots_custom_strategy WHERE owner = ? AND name = ? ORDER BY idx", CONNECTION_SYNCH);
     PrepareStatement(PLAYERBOTS_SEL_CUSTOM_STRATEGY_BY_OWNER_AND_NAME_AND_IDX, "SELECT action_line FROM playerbots_custom_strategy WHERE owner = ? AND name = ? AND idx = ?", CONNECTION_SYNCH);
-    PrepareStatement(PLAYERBOTS_DEL_CUSTOM_STRATEGY, "DELETE FROM playerbots_custom_strategy WHERE name = ? AND owner = ? AND idx = ?", CONNECTION_ASYNC);
-    PrepareStatement(PLAYERBOTS_UPD_CUSTOM_STRATEGY, "UPDATE playerbots_custom_strategy SET action_line = ? WHERE name = ? AND owner = ? AND idx = ?", CONNECTION_ASYNC);
-    PrepareStatement(PLAYERBOTS_INS_CUSTOM_STRATEGY, "INSERT INTO playerbots_custom_strategy (name, owner, idx, action_line) VALUES (?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(PLAYERBOTS_SEL_CUSTOM_STRATEGY_COUNT_BY_OWNER_AND_NAME, "SELECT COUNT(*) FROM playerbots_custom_strategy WHERE owner = ? AND name = ?", CONNECTION_SYNCH);
+    PrepareStatement(PLAYERBOTS_SEL_CUSTOM_STRATEGY_COUNT, "SELECT COUNT(*) FROM playerbots_custom_strategy WHERE owner = ? AND name = ? AND idx = ?", CONNECTION_SYNCH);
+    PrepareStatement(PLAYERBOTS_SEL_CUSTOM_STRATEGY_NAMES_EQUAL, "SELECT CAST(CASE WHEN BINARY CONVERT(CONVERT(CONVERT(? USING utf8mb4) USING utf8mb3) USING utf8mb4) = BINARY ? THEN COALESCE(MAX(name), CONVERT(CONVERT(? USING utf8mb4) USING utf8mb3)) = ? ELSE 0 END AS UNSIGNED) FROM playerbots_custom_strategy WHERE 1=0", CONNECTION_SYNCH);
+    PrepareStatement(PLAYERBOTS_DEL_CUSTOM_STRATEGY, "DELETE FROM playerbots_custom_strategy WHERE name = ? AND owner = ? AND idx = ?", CONNECTION_BOTH);
+    PrepareStatement(PLAYERBOTS_UPD_CUSTOM_STRATEGY, "UPDATE playerbots_custom_strategy SET action_line = ? WHERE name = ? AND owner = ? AND idx = ?", CONNECTION_BOTH);
+    PrepareStatement(PLAYERBOTS_INS_CUSTOM_STRATEGY, "INSERT INTO playerbots_custom_strategy (name, owner, idx, action_line) VALUES (?, ?, ?, ?)", CONNECTION_BOTH);
 
     PrepareStatement(PLAYERBOTS_SEL_DB_STORE, "SELECT `key`,`value` FROM `playerbots_db_store` WHERE `guid` = ?", CONNECTION_SYNCH);
     PrepareStatement(PLAYERBOTS_DEL_DB_STORE, "DELETE FROM `playerbots_db_store` WHERE `guid` = ?", CONNECTION_ASYNC);

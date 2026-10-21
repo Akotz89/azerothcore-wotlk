@@ -32,6 +32,7 @@
 #include "WorldSession.h"
 
 #include <limits>
+#include "LootReceipt.h"
 
 void WorldSession::HandleAutostoreLootItemOpcode(WorldPacket& recvData)
 {
@@ -199,7 +200,9 @@ void WorldSession::HandleLootMoneyOpcode(WorldPacket& /*recvData*/)
             return;
         }
 
+        LootReceipt::Money receipt("core", loot, player);
         sScriptMgr->OnPlayerBeforeLootMoney(player, loot);
+        receipt.Post(loot->gold);
         bool const splitMoney = shareMoney && player->GetGroup();
         std::vector<Player*> recipients;
         if (splitMoney)
@@ -212,7 +215,14 @@ void WorldSession::HandleLootMoneyOpcode(WorldPacket& /*recvData*/)
         else
             recipients.push_back(player);
         if (recipients.empty())
+        {
+            receipt.Recipients(recipients);
+            receipt.Balances(recipients);
+            receipt.End("no_recipients", loot->gold);
             return;
+        }
+
+        receipt.Recipients(recipients);
 
         struct Payment
         {
@@ -222,38 +232,65 @@ void WorldSession::HandleLootMoneyOpcode(WorldPacket& /*recvData*/)
         };
         std::vector<Payment> payments;
         uint32 const share = uint32(loot->gold / recipients.size());
+        LootReceipt::Emit("loot_v1 money_share op={} gold={} count={} share={} remainder={}", receipt.id, loot->gold, recipients.size(), share, loot->gold % recipients.size());
         uint32 const trialMoneyCap = sWorld->getIntConfig(CONFIG_TRIAL_MONEY_CAP);
         for (Player* recipient : recipients)
         {
             if (recipient->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME))
+            {
+                LootReceipt::Emit("loot_v1 money_skip op={} guid={} reason=no_play_time", receipt.id, recipient->GetGUID().GetRawValue());
                 continue;
+            }
             uint32 amount = share;
             if (recipient->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME))
                 amount /= 2;
             if (!amount)
+            {
+                LootReceipt::Emit("loot_v1 money_skip op={} guid={} reason=zero_share", receipt.id, recipient->GetGUID().GetRawValue());
                 continue;
+            }
 
             uint64 const total = uint64(recipient->GetMoney()) + amount;
             if (amount > uint32(std::numeric_limits<int32>::max()) || total >= uint64(MAX_MONEY_AMOUNT) ||
                 (trialMoneyCap && recipient->GetSession()->IsTrialAccount() && total > trialMoneyCap))
             {
                 recipient->SendEquipError(EQUIP_ERR_TOO_MUCH_GOLD, nullptr, nullptr);
+                receipt.Balances(recipients);
+                receipt.End("preflight_refused", loot->gold);
                 return;
             }
+            LootReceipt::Emit("loot_v1 money_plan op={} guid={} amount={}", receipt.id, recipient->GetGUID().GetRawValue(), amount);
             payments.push_back({ recipient, amount, recipient->GetMoney() });
         }
         if (payments.empty())
+        {
+            receipt.Balances(recipients);
+            receipt.End("no_payments", loot->gold);
             return;
+        }
 
         // shortcut: custom money hooks need transactional payouts; balance rollback cannot undo their other effects.
         for (Payment const& payment : payments)
-            if (!payment.recipient->ModifyMoney(int32(payment.amount)))
+        {
+            uint32 const receiptBefore = payment.recipient->GetMoney();
+            bool const receiptAccepted = payment.recipient->ModifyMoney(int32(payment.amount));
+            receipt.Credit(payment.recipient->GetGUID().GetRawValue(), payment.amount,
+                receiptBefore, payment.recipient->GetMoney(), receiptAccepted, "modify");
+            if (!receiptAccepted)
             {
                 for (Payment const& rollback : payments)
                     if (rollback.recipient->GetMoney() != rollback.previousMoney)
+                    {
+                        uint32 const receiptRollbackBefore = rollback.recipient->GetMoney();
                         rollback.recipient->SetMoney(rollback.previousMoney);
+                        receipt.Credit(rollback.recipient->GetGUID().GetRawValue(), 0,
+                            receiptRollbackBefore, rollback.recipient->GetMoney(), true, "rollback");
+                    }
+                receipt.Balances(recipients);
+                receipt.End("modify_refused_rollback", loot->gold);
                 return;
             }
+        }
 
         if (!splitMoney)
             sScriptMgr->OnPlayerAfterCreatureLootMoney(player);
@@ -271,11 +308,16 @@ void WorldSession::HandleLootMoneyOpcode(WorldPacket& /*recvData*/)
         // a script that grants money from this hook bypasses the play time restriction
         sScriptMgr->OnLootMoney(player, loot->gold);
 
+        uint32 const receiptRemoved = loot->gold;
         loot->gold = 0;
 
         // Delete the money loot record from the DB
         if (loot->containerGUID)
             sLootItemStorage->RemoveStoredLootMoney(loot->containerGUID, loot);
+
+        receipt.Balances(recipients);
+
+        receipt.End("removed", loot->gold, receiptRemoved);
 
         // Delete container if empty
         if (loot->isLooted() && guid.IsItem())
@@ -481,17 +523,22 @@ void WorldSession::HandleLootMasterGiveOpcode(WorldPacket& recvData)
 
     recvData >> lootguid >> slotid >> target_playerguid;
 
+    uint64 const receiptRequest = LootReceipt::Next();
+    LootReceipt::Emit("loot_v1 master_request op={} requested_source={} slot={} actor={} target={} map={} instance={}",
+        receiptRequest, lootguid.GetRawValue(), slotid, _player->GetGUID().GetRawValue(), target_playerguid.GetRawValue(), _player->GetMapId(), _player->GetInstanceId());
+    auto receiptReject = [&](char const* reason) noexcept
+    { LootReceipt::Emit("loot_v1 master_rejected op={} reason={}", receiptRequest, reason); };
     if (!_player->GetGroup() || _player->GetGroup()->GetMasterLooterGuid() != _player->GetGUID() || _player->GetGroup()->GetLootMethod() != MASTER_LOOT)
     {
         _player->SendLootError(lootguid, LOOT_ERROR_DIDNT_KILL);
-        return;
+        { receiptReject("authority"); return; }
     }
 
     Player* target = ObjectAccessor::GetPlayer(*_player, target_playerguid);
     if (!target)
     {
         _player->SendLootError(lootguid, LOOT_ERROR_PLAYER_NOT_FOUND);
-        return;
+        { receiptReject("missing_target"); return; }
     }
 
     LOG_DEBUG("network", "WorldSession::HandleLootMasterGiveOpcode (CMSG_LOOT_MASTER_GIVE, 0x02A3) Target = [{}].", target->GetName());
@@ -499,14 +546,14 @@ void WorldSession::HandleLootMasterGiveOpcode(WorldPacket& recvData)
     if (_player->GetLootGUID() != lootguid)
     {
         _player->SendLootError(lootguid, LOOT_ERROR_DIDNT_KILL);
-        return;
+        { receiptReject("source_mismatch"); return; }
     }
 
     if (!_player->IsInRaidWith(target) || target->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME))
     {
         _player->SendLootError(lootguid, LOOT_ERROR_MASTER_OTHER);
         //LOG_DEBUG("network", "MasterLootItem: Player {} tried to give an item to ineligible player {} !", GetPlayer()->GetName(), target->GetName());
-        return;
+        { receiptReject("ineligible_target"); return; }
     }
 
     Loot* loot = nullptr;
@@ -515,7 +562,7 @@ void WorldSession::HandleLootMasterGiveOpcode(WorldPacket& recvData)
     {
         Creature* creature = GetPlayer()->GetMap()->GetCreature(lootguid);
         if (!creature)
-            return;
+            { receiptReject("missing_creature"); return; }
 
         loot = &creature->loot;
     }
@@ -523,21 +570,24 @@ void WorldSession::HandleLootMasterGiveOpcode(WorldPacket& recvData)
     {
         GameObject* pGO = GetPlayer()->GetMap()->GetGameObject(lootguid);
         if (!pGO)
-            return;
+            { receiptReject("missing_gameobject"); return; }
 
         loot = &pGO->loot;
     }
 
     if (!loot)
-        return;
+        { receiptReject("no_source"); return; }
 
     if (slotid >= loot->items.size() + loot->quest_items.size())
     {
         LOG_DEBUG("loot", "MasterLootItem: Player {} might be using a hack! (slot {}, size {})", GetPlayer()->GetName(), slotid, (unsigned long)loot->items.size());
-        return;
+        { receiptReject("invalid_slot"); return; }
     }
 
     LootItem& item = slotid >= loot->items.size() ? loot->quest_items[slotid - loot->items.size()] : loot->items[slotid];
+
+    LootReceipt::Award receipt("master", loot, &item, target, slotid);
+    LootReceipt::Emit("loot_v1 master_resolved request={} award={}", receiptRequest, receipt.id);
 
     ItemPosCountVec dest;
     InventoryResult msg = target->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, item.itemid, item.count);
@@ -552,6 +602,7 @@ void WorldSession::HandleLootMasterGiveOpcode(WorldPacket& recvData)
         else
             _player->SendLootError(lootguid, LOOT_ERROR_MASTER_OTHER);
 
+        receipt.End("store_refused", uint32(msg));
         return;
     }
 
@@ -559,7 +610,9 @@ void WorldSession::HandleLootMasterGiveOpcode(WorldPacket& recvData)
     AllowedLooterSet looters = item.GetAllowedLooters();
 
     // not move item from loot to target inventory
+    LootReceipt::Destinations(receipt.id, "before", target, dest);
     Item* newitem = target->StoreNewItem(dest, item.itemid, true, item.randomPropertyId, looters);
+    LootReceipt::Destinations(receipt.id, "stored", target, dest);
     target->SendNewItem(newitem, uint32(item.count), false, false, true);
     target->UpdateLootAchievements(&item, loot);
 
@@ -569,4 +622,6 @@ void WorldSession::HandleLootMasterGiveOpcode(WorldPacket& recvData)
 
     loot->NotifyItemRemoved(slotid);
     --loot->unlootedCount;
+    LootReceipt::Destinations(receipt.id, "after_hooks", target, dest);
+    receipt.End("native_consumed", uint32(msg));
 }
