@@ -84,8 +84,15 @@ public:
     MOCK_METHOD(time_t, GetNextTimeWithMonthAndHour, (int8 month, int8 hour), ());
     MOCK_METHOD(std::string const&, GetRealmName, (), (const));
     MOCK_METHOD(void, SetRealmName, (std::string name), ());
+    SQLQueryHolderCallback& AddQueryHolderCallback(SQLQueryHolderCallback&& callback) override
+    {
+        return _queryHolderProcessor.AddCallback(std::move(callback));
+    }
     MOCK_METHOD(void, RemoveOldCorpses, ());
     MOCK_METHOD(void, ReloadRBAC, ());
+
+private:
+    AsyncCallbackProcessor<SQLQueryHolderCallback> _queryHolderProcessor;
 };
 #pragma GCC diagnostic pop
 
