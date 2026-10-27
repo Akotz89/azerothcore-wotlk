@@ -299,11 +299,13 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
     ASSERT_EQ(phase.phaseId, "1_19");
 
     VendorSourceTestAccess::ReplaceRows(*sObjectMgr, VendorEntry, {
-        VendorItem(ItemEntry, 3, 45, 0, VendorItemSourceKind::NpcVendorRow, SourceSlot)
+        VendorItem(ItemEntry, 3, 45, 0, VendorItemSourceKind::NpcVendorRow, SourceSlot),
+        VendorItem(1999999998, 0, 0, 0, VendorItemSourceKind::VendorReferenceExpansion),
+        VendorItem(1999999997, 0, 0, 0, VendorItemSourceKind::Runtime)
     });
     VendorItemData const* const shiftedList = sObjectMgr->GetNpcVendorItemList(VendorEntry);
     ASSERT_NE(shiftedList, nullptr);
-    ASSERT_EQ(shiftedList->GetItemCount(), 1u);
+    ASSERT_EQ(shiftedList->GetItemCount(), 3u);
     ASSERT_NE(shiftedList->GetItem(0), nullptr);
     EXPECT_EQ(shiftedList->GetItem(0)->sourceSlot, SourceSlot)
         << "the loaded-list index 0 must remain distinct from the original npc_vendor slot 37";
@@ -474,7 +476,57 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
         "assert 'VerifiedBuild' in source_row['unknown_semantics']\n"
         "source_repeat = ac.strategic_read_loaded_source_snapshot(source_request)\n"
         "assert source_repeat['source_snapshot_id'] == source_first['source_snapshot_id']\n"
-        "assert source_repeat['capture_epoch_monotonic_ns'] >= source_first['capture_epoch_monotonic_ns']\n");
+        "assert source_repeat['capture_epoch_monotonic_ns'] >= source_first['capture_epoch_monotonic_ns']\n"
+        "loaded_enum = ac.strategic_enumerate_loaded_vendor_sources(16384)\n"
+        "assert loaded_enum['schema'] == 'cpi211-loaded-vendor-enumeration-v1'\n"
+        "assert loaded_enum['valid'] is True and loaded_enum['complete'] is True\n"
+        "assert loaded_enum['truncated'] is False and loaded_enum['one_shot'] is True\n"
+        "assert loaded_enum['cursor'] is None and loaded_enum['reload_generation_available'] is False\n"
+        "assert loaded_enum['actor_eligibility_evaluated'] is False and loaded_enum['resources_evaluated'] is False\n"
+        "assert loaded_enum['action_authority'] is False and loaded_enum['quote_bound'] is False\n"
+        "assert len(loaded_enum['native_source_snapshot_id']) == 64\n"
+        "assert loaded_enum['native_source_snapshot_id'].upper() == loaded_enum['native_source_snapshot_id']\n"
+        "loaded_enum_repeat = ac.strategic_enumerate_loaded_vendor_sources(16384)\n"
+        "assert loaded_enum_repeat['native_source_snapshot_id'] == loaded_enum['native_source_snapshot_id']\n"
+        "assert loaded_enum['native_source_snapshot_id'] != source_first['source_snapshot_id']\n"
+        "assert loaded_enum['coverage']['raw_source_generation_coverage'] == 'unknown'\n"
+        "assert loaded_enum['coverage']['all_fourteen_family_parity'] is False\n"
+        "direct = next(row for row in loaded_enum['rows'] if row['source_key_known'] and row['natural_key']['entry'] == 3900001)\n"
+        "assert direct['natural_key'] == {'entry':3900001,'slot':37,'item':1999999999}\n"
+        "assert direct['loaded_index'] == 0 and direct['loaded_item'] == 1999999999\n"
+        "assert direct['source_kind'] == 'npc_vendor_row'\n"
+        "assert direct['metrics']['risk']['state'] == 'unknown' and direct['metrics']['risk']['value'] is None\n"
+        "assert direct['metrics']['contention']['state'] == 'unknown' and direct['metrics']['contention']['value'] is None\n"
+        "reference = next(row for row in loaded_enum['rows'] if row['source_kind'] == 'vendor_reference_expansion')\n"
+        "runtime = next(row for row in loaded_enum['rows'] if row['source_kind'] == 'runtime_vendor_item')\n"
+        "assert reference['source_key_known'] is False and reference['natural_key'] is None\n"
+        "assert runtime['source_key_known'] is False and runtime['natural_key'] is None\n"
+        "assert loaded_enum['coverage']['unsupported_reference_rows'] >= 1\n"
+        "assert loaded_enum['coverage']['runtime_rows'] >= 1\n"
+        "import os, pathlib, sys\n"
+        "native_test_root = pathlib.Path(os.environ['CPI211_NATIVE_TEST_ROOT'])\n"
+        "task_root = native_test_root.parents[4]\n"
+        "compiled_package_dir = native_test_root.parents[1] / 'gear-consumer-package'\n"
+        "package_dir = task_root / 'worker/wow-private-server/tools/playerbots-strategic-director'\n"
+        "consumer_dir = task_root / 'worker/wow-private-server/integration/cpi-225-native-earned-upgrade-20261021/runtime/population/python/lib'\n"
+        "os.environ['PBGUIDE_TEST_PACKAGE_DIR'] = str(package_dir)\n"
+        "os.environ['PBGUIDE_TEST_CONSUMER_DIR'] = str(consumer_dir)\n"
+        "sys.path.insert(0, str(consumer_dir))\n"
+        "sys.path.insert(0, str(consumer_dir.parents[3] / 'tests'))\n"
+        "sys.path.insert(0, str(compiled_package_dir))\n"
+        "sys.path.insert(0, str(package_dir))\n"
+        "import test_native_acquisition_v2_consumer as v2_consumer_test\n"
+        "v2_consumer_test.run_embedded_compiled_provider_consumer(ac)\n"
+        "for bad_cap in [0, True, '16384', 16385]:\n"
+        "    try:\n"
+        "        ac.strategic_enumerate_loaded_vendor_sources(bad_cap)\n"
+        "        raise AssertionError('invalid loaded vendor enumeration cap accepted')\n"
+        "    except RuntimeError as error:\n"
+        "        assert '1..16384' in str(error)\n"
+        "partial = ac.strategic_enumerate_loaded_vendor_sources(1)\n"
+        "assert partial['valid'] is True and partial['complete'] is False and partial['truncated'] is True\n"
+        "assert partial['native_source_snapshot_id'] is None\n"
+        "assert partial['copied_rows'] == 1 and partial['row_cap'] == 1\n");
     ASSERT_TRUE(initial) << initial.error;
 
     auto const negativeCases = sPythonEngine->ExecuteCode(
@@ -512,7 +564,12 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
         "assert source_ambiguous['valid'] is True\n"
         "assert source_ambiguous['rows'][0]['matched'] is False\n"
         "assert source_ambiguous['rows'][0]['reason'] == 'vendor_source_row_ambiguous'\n"
-        "assert source_ambiguous['coverage']['unmatched_rows'] == 1\n");
+        "assert source_ambiguous['coverage']['unmatched_rows'] == 1\n"
+        "ambiguous_enum = ac.strategic_enumerate_loaded_vendor_sources(16384)\n"
+        "duplicate_rows = [row for row in ambiguous_enum['rows'] if row['source_key_known'] and row['natural_key']['entry'] == 3900001]\n"
+        "assert len(duplicate_rows) == 2\n"
+        "assert duplicate_rows[0]['natural_key'] == duplicate_rows[1]['natural_key']\n"
+        "assert duplicate_rows[0]['loaded_index'] != duplicate_rows[1]['loaded_index']\n");
     ASSERT_TRUE(ambiguous) << ambiguous.error;
 
     VendorSourceTestAccess::ReplaceRows(*sObjectMgr, VendorEntry, {
@@ -521,7 +578,10 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
     auto const changed = sPythonEngine->ExecuteCode(
         "source_changed = ac.strategic_read_loaded_source_snapshot(source_request)\n"
         "assert source_changed['rows'][0]['matched'] is True\n"
-        "assert source_changed['source_snapshot_id'] != source_first['source_snapshot_id']\n");
+        "assert source_changed['source_snapshot_id'] != source_first['source_snapshot_id']\n"
+        "loaded_changed = ac.strategic_enumerate_loaded_vendor_sources(16384)\n"
+        "assert loaded_changed['complete'] is True\n"
+        "assert loaded_changed['native_source_snapshot_id'] != loaded_enum['native_source_snapshot_id']\n");
     ASSERT_TRUE(changed) << changed.error;
 
     std::string wrongThreadError;
@@ -532,6 +592,11 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
             "try:\n"
             "    ac.strategic_read_loaded_source_snapshot(source_request)\n"
             "    raise AssertionError('native read accepted off world thread')\n"
+            "except RuntimeError as error:\n"
+            "    assert 'native world thread' in str(error)\n"
+            "try:\n"
+            "    ac.strategic_enumerate_loaded_vendor_sources(16384)\n"
+            "    raise AssertionError('loaded vendor enumeration accepted off world thread')\n"
             "except RuntimeError as error:\n"
             "    assert 'native world thread' in str(error)\n");
         wrongThreadExecutionSucceeded = static_cast<bool>(refusal);
@@ -549,6 +614,9 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
         "assert source_refused['valid'] is False\n"
         "assert source_refused['reason'] == 'shared_phase_unavailable'\n"
         "assert source_refused['coverage']['not_evaluated_rows'] == 1\n"
-        "assert source_refused['coverage']['unmatched_rows'] == 0\n");
+        "assert source_refused['coverage']['unmatched_rows'] == 0\n"
+        "enum_refused = ac.strategic_enumerate_loaded_vendor_sources(16384)\n"
+        "assert enum_refused['valid'] is False and enum_refused['complete'] is False\n"
+        "assert enum_refused['native_source_snapshot_id'] is None\n");
     EXPECT_TRUE(phaseRefusal) << phaseRefusal.error;
 }

@@ -1454,6 +1454,7 @@ public:
 
         return &iter->second;
     }
+    [[nodiscard]] CacheVendorItemContainer const& GetNpcVendorItemLists() const { return _cacheVendorItemStore; }
 
     void AddVendorItem(uint32 entry, uint32 item, uint32 maxcount, uint32 incrtime, uint32 extendedCost, bool persist = true); // for event
     bool RemoveVendorItem(uint32 entry, uint32 item, bool persist = true); // for event
