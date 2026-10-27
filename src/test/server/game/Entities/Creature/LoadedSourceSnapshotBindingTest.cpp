@@ -2,7 +2,6 @@
 #include "Database/Field.h"
 #include "Globals/ObjectMgr.h"
 #include "DataStores/DBCStores.h"
-#include "Maps/AreaDefines.h"
 #include "Quests/QuestDef.h"
 #include "Scripting/ScriptDefines/AllCreatureScript.h"
 #include "Scripting/ScriptDefines/CreatureScript.h"
@@ -113,25 +112,6 @@ public:
         manager._questTemplatesFast.resize(originalCount);
     }
 
-    static AreaTableEntry* ReplaceArea(uint32 id, uint32 mapId, uint32 zoneId)
-    {
-        AreaTableEntry const* existing = sAreaTableStore.LookupEntry(id);
-        AreaTableEntry* previous = existing ? new AreaTableEntry(*existing) : nullptr;
-        auto* replacement = new AreaTableEntry{};
-        replacement->ID = id;
-        replacement->mapid = mapId;
-        replacement->zone = zoneId;
-        sAreaTableStore.SetEntry(id, replacement);
-        return previous;
-    }
-
-    static void RestoreArea(uint32 id, AreaTableEntry* previous)
-    {
-        // DBCStorage owns and deletes entries passed to SetEntry. Preserve the
-        // prior value before replacing it so test DBC rows are fully restored.
-        sAreaTableStore.SetEntry(id, previous);
-    }
-
     static CreatureTemplate* SetCreatureScript(ObjectMgr& manager, uint32 entry, uint32 scriptId,
                                                CreatureTemplate*& previous)
     {
@@ -155,7 +135,7 @@ public:
     }
 };
 
-TEST_F(IntegrationTestFixture, PhaseQuestSourcePolicyUsesMinimumLevelAndAreaTable)
+TEST_F(IntegrationTestFixture, PhaseQuestSourcePolicyMatchesAcceptedLevelAndFlags)
 {
     constexpr uint32 QuestId = 3861;
     ASSERT_NE(sObjectMgr, nullptr);
@@ -163,8 +143,6 @@ TEST_F(IntegrationTestFixture, PhaseQuestSourcePolicyUsesMinimumLevelAndAreaTabl
     auto* quest = new PolicyTestQuest(fields.data());
     size_t const previousQuestCount = VendorSourceTestAccess::QuestCount(*sObjectMgr);
     Quest* previousQuest = VendorSourceTestAccess::ReplaceQuest(*sObjectMgr, QuestId, quest);
-    AreaTableEntry* previousEversong = VendorSourceTestAccess::ReplaceArea(AREA_EVERSONG_WOODS, 530, 0);
-    AreaTableEntry* previousHellfire = VendorSourceTestAccess::ReplaceArea(AREA_HELLFIRE_PENINSULA, 530, 0);
 
     struct Cleanup
     {
@@ -173,29 +151,28 @@ TEST_F(IntegrationTestFixture, PhaseQuestSourcePolicyUsesMinimumLevelAndAreaTabl
         Quest* previousQuest;
         Quest* replacementQuest;
         size_t previousQuestCount;
-        AreaTableEntry* previousEversong;
-        AreaTableEntry* previousHellfire;
         ~Cleanup()
         {
             VendorSourceTestAccess::RestoreQuest(manager, questId, previousQuest, previousQuestCount);
             delete replacementQuest;
-            VendorSourceTestAccess::RestoreArea(AREA_EVERSONG_WOODS, previousEversong);
-            VendorSourceTestAccess::RestoreArea(AREA_HELLFIRE_PENINSULA, previousHellfire);
         }
-    } cleanup{*sObjectMgr, QuestId, previousQuest, quest, previousQuestCount, previousEversong, previousHellfire};
+    } cleanup{*sObjectMgr, QuestId, previousQuest, quest, previousQuestCount};
 
     auto allowed = [&] { return ProgressionSystem::ReadQuestSourcePolicy(QuestId).templateAllowed; };
-    quest->SetPolicy(QuestId, 0, 19, 80, 0);
-    EXPECT_TRUE(allowed()) << "suggested quest level must not replace minimum-level eligibility";
-    quest->SetPolicy(QuestId, 0, 20, 20, 0);
-    EXPECT_FALSE(allowed());
+    quest->SetPolicy(QuestId, 0, 1, 19, 0);
+    EXPECT_TRUE(allowed()) << "level-19 quest with minimum level 1 remains eligible";
 
-    quest->SetPolicy(QuestId, AREA_EVERSONG_WOODS, 1, 20, QUEST_FLAGS_TBC);
-    EXPECT_TRUE(allowed()) << "TBC metadata does not make a loaded Eversong area unavailable";
-    quest->SetPolicy(QuestId, AREA_HELLFIRE_PENINSULA, 1, 10, QUEST_FLAGS_TBC);
-    EXPECT_FALSE(allowed()) << "Outland geography remains denied even without using the TBC flag";
-    quest->SetPolicy(QuestId, AREA_HELLFIRE_PENINSULA, 1, 10, 0);
-    EXPECT_FALSE(allowed()) << "Outland geography is checked independently of expansion metadata";
+    quest->SetPolicy(QuestId, 0, 1, 20, 0);
+    EXPECT_FALSE(allowed()) << "quest-level ceiling remains enforced";
+    quest->SetPolicy(QuestId, 0, 20, 19, 0);
+    EXPECT_FALSE(allowed()) << "minimum-level ceiling remains enforced";
+
+    quest->SetPolicy(QuestId, 0, 1, 10, QUEST_FLAGS_TBC);
+    EXPECT_FALSE(allowed()) << "TBC-flagged quests remain excluded under accepted compatibility policy";
+    quest->SetPolicy(QuestId, 0, 1, 10, QUEST_FLAGS_RAID);
+    EXPECT_FALSE(allowed()) << "raid quests remain excluded";
+    quest->SetPolicy(QuestId, 0, 1, 10, QUEST_FLAGS_UNAVAILABLE);
+    EXPECT_FALSE(allowed()) << "unavailable quests remain excluded";
 }
 
 TEST_F(IntegrationTestFixture, RegisteredChickenQuestRewardResetsItsAI)
