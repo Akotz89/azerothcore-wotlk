@@ -47,6 +47,33 @@ endif()
 
 # Link modules library to tests so module code is available
 if(TARGET modules)
+    # The worldserver and unit_tests share the production modules archive. Compile
+    # only the bridge translation unit again for unit_tests so fixture registration
+    # helpers never enter the production modules archive or worldserver.
+    add_library(cpi211_test_population_bridge OBJECT
+        "${CMAKE_SOURCE_DIR}/modules/mod-playerbots/src/Guide/PythonPopulationBridge.cpp")
+    get_target_property(CPI211_MODULE_INCLUDE_DIRECTORIES modules INCLUDE_DIRECTORIES)
+    get_target_property(CPI211_MODULE_COMPILE_DEFINITIONS modules COMPILE_DEFINITIONS)
+    get_target_property(CPI211_MODULE_COMPILE_OPTIONS modules COMPILE_OPTIONS)
+    get_target_property(CPI211_MODULE_COMPILE_FEATURES modules COMPILE_FEATURES)
+    get_target_property(CPI211_MODULE_LINK_LIBRARIES modules LINK_LIBRARIES)
+    if(CPI211_MODULE_INCLUDE_DIRECTORIES)
+        target_include_directories(cpi211_test_population_bridge PRIVATE ${CPI211_MODULE_INCLUDE_DIRECTORIES})
+    endif()
+    if(CPI211_MODULE_COMPILE_DEFINITIONS)
+        target_compile_definitions(cpi211_test_population_bridge PRIVATE ${CPI211_MODULE_COMPILE_DEFINITIONS})
+    endif()
+    if(CPI211_MODULE_COMPILE_OPTIONS)
+        target_compile_options(cpi211_test_population_bridge PRIVATE ${CPI211_MODULE_COMPILE_OPTIONS})
+    endif()
+    if(CPI211_MODULE_COMPILE_FEATURES)
+        target_compile_features(cpi211_test_population_bridge PRIVATE ${CPI211_MODULE_COMPILE_FEATURES})
+    endif()
+    if(CPI211_MODULE_LINK_LIBRARIES)
+        target_link_libraries(cpi211_test_population_bridge PRIVATE ${CPI211_MODULE_LINK_LIBRARIES})
+    endif()
+    target_compile_definitions(cpi211_test_population_bridge PRIVATE CPI211_NATIVE_TEST_FIXTURE=1)
+    target_sources(unit_tests PRIVATE $<TARGET_OBJECTS:cpi211_test_population_bridge>)
     target_link_libraries(unit_tests modules)
     target_link_libraries(unit_tests scripts)
     target_link_libraries(unit_tests game)
@@ -65,5 +92,11 @@ add_test(
         COMMAND
         ${CMAKE_BINARY_DIR}/src/test/unit_tests
 )
+set(CPI211_NATIVE_TEST_ROOT "${CMAKE_BINARY_DIR}/cpi211-native-test" CACHE PATH
+    "Writable root for CPI-211 native unit-test fixtures")
+set(CPI211_TASK_ROOT "" CACHE PATH
+    "Task workspace root used to find CPI-211 test-only package and consumer inputs")
+set(CPI211_COMPILED_PACKAGE_DIR "${CMAKE_BINARY_DIR}/gear-consumer-package" CACHE PATH
+    "Compiled strategic-director package used by CPI-211 native integration tests")
 set_tests_properties(unit PROPERTIES
-    ENVIRONMENT "CPI211_NATIVE_TEST_ROOT=${CMAKE_BINARY_DIR}/cpi211-native-test")
+    ENVIRONMENT "CPI211_NATIVE_TEST_ROOT=${CPI211_NATIVE_TEST_ROOT};CPI211_TASK_ROOT=${CPI211_TASK_ROOT};CPI211_COMPILED_PACKAGE_DIR=${CPI211_COMPILED_PACKAGE_DIR}")

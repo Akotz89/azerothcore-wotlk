@@ -1,13 +1,23 @@
 #include "Config.h"
 #include "Database/Field.h"
 #include "Globals/ObjectMgr.h"
+#include "Globals/ObjectAccessor.h"
+#include "Entities/Item/ItemTemplate.h"
+#include "Cache/CharacterCache.h"
 #include "DataStores/DBCStores.h"
 #include "Quests/QuestDef.h"
 #include "Scripting/ScriptDefines/AllCreatureScript.h"
 #include "Scripting/ScriptDefines/CreatureScript.h"
 #include "Hooks/Defines/CreatureHook.h"
 #include "Scripting/ScriptMgr.h"
+#include "Scripting/ScriptDefines/AchievementScript.h"
 #include "PopulationBridge.h"
+#include "Bot/PlayerbotAI.h"
+#include "Bot/PlayerbotMgr.h"
+#include "Bot/RandomPlayerbotMgr.h"
+#include "Bot/Engine/AiObjectContext.h"
+#include "Bot/Engine/Value/Value.h"
+#include "PlayerbotAIConfig.h"
 #include "ProgressionSystem.h"
 #include "PythonEngine.h"
 #include "IntegrationTestFixture.h"
@@ -27,6 +37,8 @@ void RegisterPythonPopulationBridge();
 void AddSC_progression_system_shared_phase_snapshot();
 void AddSC_PythonCreatureScripts();
 void AddSC_npcs_special();
+bool RegisterCpi211TestOnlyPopulationActor(std::string const&, Player*);
+void UnregisterCpi211TestOnlyPopulationActor(std::string const&, Player*);
 
 class QuestHookFallbackScript final : public CreatureScript
 {
@@ -74,9 +86,126 @@ public:
     }
 };
 
+class AchievementHookRegistryFixture
+{
+public:
+    using Registry = ScriptRegistry<AchievementScript>;
+
+    AchievementHookRegistryFixture() : _previousHooks(Registry::EnabledHooks)
+    {
+        if (Registry::EnabledHooks.empty())
+            Registry::InitEnabledHooksIfNeeded(ACHIEVEMENTHOOK_END);
+    }
+
+    ~AchievementHookRegistryFixture()
+    {
+        Registry::EnabledHooks = std::move(_previousHooks);
+    }
+
+private:
+    Registry::EnabledHooksVector _previousHooks;
+};
+
 class VendorSourceTestAccess
 {
 public:
+    static bool HasCurrentBot(RandomPlayerbotMgr const& manager, uint32 guid)
+    {
+        return manager.currentBots.contains(guid);
+    }
+
+    static void SetCurrentBotMembership(RandomPlayerbotMgr& manager, uint32 guid, bool present)
+    {
+        if (present)
+            manager.currentBots.insert(guid);
+        else
+            manager.currentBots.erase(guid);
+    }
+
+    static BotEventCache SnapshotEventCache(RandomPlayerbotMgr const& manager, uint32 guid, bool& existed)
+    {
+        auto const found = manager.eventCache.find(guid);
+        existed = found != manager.eventCache.end();
+        return existed ? found->second : BotEventCache{};
+    }
+
+    static void SetEventCache(RandomPlayerbotMgr& manager, uint32 guid, BotEventCache cache)
+    {
+        manager.eventCache[guid] = std::move(cache);
+    }
+
+    static void RestoreEventCache(RandomPlayerbotMgr& manager, uint32 guid, bool existed, BotEventCache cache)
+    {
+        if (existed)
+            manager.eventCache[guid] = std::move(cache);
+        else
+            manager.eventCache.erase(guid);
+    }
+
+    struct VendorRowsSnapshot
+    {
+        bool existed{false};
+        std::vector<VendorItem> rows;
+    };
+
+    static VendorRowsSnapshot SnapshotRows(ObjectMgr const& manager, uint32 entry)
+    {
+        VendorRowsSnapshot snapshot;
+        auto const found = manager._cacheVendorItemStore.find(entry);
+        if (found == manager._cacheVendorItemStore.end())
+            return snapshot;
+        snapshot.existed = true;
+        snapshot.rows.reserve(found->second.m_items.size());
+        for (VendorItem const* row : found->second.m_items)
+            if (row)
+                snapshot.rows.emplace_back(*row);
+        return snapshot;
+    }
+
+    static void RestoreRows(ObjectMgr& manager, uint32 entry, VendorRowsSnapshot const& snapshot)
+    {
+        if (snapshot.existed)
+            ReplaceRows(manager, entry, snapshot.rows);
+        else
+            ClearRows(manager, entry);
+    }
+
+    static ItemTemplate* ReplaceItem(ObjectMgr& manager, uint32 entry, ItemTemplate* replacement)
+    {
+        auto& items = manager._itemTemplateStoreFast;
+        if (items.size() <= entry)
+            items.resize(entry + 1, nullptr);
+        ItemTemplate* previous = items[entry];
+        items[entry] = replacement;
+        return previous;
+    }
+
+    static void RestoreItem(ObjectMgr& manager, uint32 entry, ItemTemplate* previous)
+    {
+        manager._itemTemplateStoreFast[entry] = previous;
+    }
+
+    static ItemTemplate SnapshotStoreItem(ObjectMgr const& manager, uint32 entry, bool& existed)
+    {
+        auto const& items = manager._itemTemplateStore;
+        auto const found = items.find(entry);
+        existed = found != items.end();
+        return existed ? found->second : ItemTemplate{};
+    }
+
+    static void ReplaceStoreItem(ObjectMgr& manager, uint32 entry, ItemTemplate const& item)
+    {
+        manager._itemTemplateStore[entry] = item;
+    }
+
+    static void RestoreStoreItem(ObjectMgr& manager, uint32 entry, bool existed, ItemTemplate const& previous)
+    {
+        if (existed)
+            manager._itemTemplateStore[entry] = previous;
+        else
+            manager._itemTemplateStore.erase(entry);
+    }
+
     static void ReplaceRows(ObjectMgr& manager, uint32 entry, std::vector<VendorItem> const& rows)
     {
         VendorItemData& list = manager._cacheVendorItemStore[entry];
@@ -261,16 +390,56 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
     ASSERT_NE(testRootValue, nullptr);
     std::filesystem::path const testRoot(testRootValue);
     std::filesystem::create_directories(testRoot);
+    std::filesystem::path const scriptsRoot = testRoot / "population-scripts";
+    std::filesystem::create_directories(scriptsRoot);
+    std::filesystem::path const populationEntry = scriptsRoot / "cpi211-test-population.py";
+    {
+        std::ofstream script(populationEntry, std::ios::trunc);
+        script << "import azerothcore as ac\n"
+               << "def population_tick(diff_ms):\n"
+               << "    global cpi211_population_tick_result, cpi211_population_tick_error, cpi211_replay_result, cpi211_native_offer, cpi211_test_gear_snapshot, cpi211_test_probe_removed_identity, cpi211_removed_identity\n"
+               << "    if cpi211_test_witness is None:\n"
+               << "        cpi211_test_gear_snapshot = ac.strategic_read_gear_snapshot(cpi211_test_actor_identity, 0)\n"
+               << "        cpi211_population_tick_result = True\n"
+               << "        return True\n"
+               << "    if cpi211_test_probe_removed_identity:\n"
+               << "        cpi211_test_probe_removed_identity = False\n"
+               << "        cpi211_removed_identity = ac.strategic_read_quest_snapshot(cpi211_test_actor_identity, 0)\n"
+               << "        cpi211_population_tick_result = True\n"
+               << "        return True\n"
+               << "    try:\n"
+               << "        offers = ac.strategic_read_vendor_offers(cpi211_test_witness.key, [103])\n"
+               << "        cpi211_native_offer = next(row for row in offers if row['vendor_entry'] == 3900002 and row['vendor_slot'] == 0)\n"
+               << "        request_id = cpi211_native_offer['request_id']\n"
+               << "        assert len(request_id) == 64 and all(character in '0123456789abcdef' for character in request_id)\n"
+               << "        assert any(character in 'abcdef' for character in request_id), repr(request_id)\n"
+               << "        uppercase = ac.strategic_buy_vendor_item(cpi211_test_witness.key, request_id.upper(), cpi211_native_offer['source_id'], 103, 16)\n"
+               << "        malformed = ac.strategic_buy_vendor_item(cpi211_test_witness.key, request_id[:-1], cpi211_native_offer['source_id'], 103, 16)\n"
+               << "        assert uppercase['status'] == malformed['status'] == 'refused_before_effect'\n"
+               << "        assert uppercase['reason'] == malformed['reason'] == 'consumed_request'\n"
+               << "        cpi211_population_tick_result = cpi211_test_witness.tick(diff_ms)\n"
+               << "        purchase = next(row for row in cpi211_test_witness._cpi211_test_audit_rows if row.get('event') == 'vendor_purchase')\n"
+               << "        receipt = purchase['native_receipt']\n"
+               << "        assert cpi211_native_offer['request_id'] == receipt['request_id']\n"
+               << "        cpi211_replay_result = ac.strategic_buy_vendor_item(cpi211_test_witness.key, cpi211_native_offer['request_id'], cpi211_native_offer['source_id'], receipt['item'], purchase['target']['slot'])\n"
+               << "        return True\n"
+               << "    except Exception as error:\n"
+               << "        cpi211_population_tick_error = repr((error, offers if 'offers' in locals() else None, cpi211_test_gear_snapshot, cpi211_population_tick_result, cpi211_test_witness.status, cpi211_test_witness._cpi211_test_audit_rows))\n"
+               << "        raise\n";
+        ASSERT_TRUE(static_cast<bool>(script));
+    }
     std::filesystem::path const configPath = testRoot / "native-source-observation.conf";
     struct ConfigCleanup
     {
         std::filesystem::path path;
+        std::filesystem::path scriptsRoot;
         ~ConfigCleanup()
         {
             std::error_code error;
             std::filesystem::remove(path, error);
+            std::filesystem::remove_all(scriptsRoot, error);
         }
-    } configCleanup{configPath};
+    } configCleanup{configPath, scriptsRoot};
 
     auto writeConfig = [&](bool gateEnabled)
     {
@@ -278,6 +447,8 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
         config << "[worldserver]\n"
                << "Python.Enabled = 1\n"
                << "Python.Population.Enabled = 1\n"
+               << "Python.ScriptsPath = " << scriptsRoot.string() << "\n"
+               << "Python.Population.EntryScript = cpi211-test-population.py\n"
                << "ProgressionSystem.LoadScripts = 1\n"
                << "ProgressionSystem.LoadDatabase = 1\n"
                << "ProgressionSystem.SharedPhaseGate.Enable = " << (gateEnabled ? 1 : 0) << "\n"
@@ -298,11 +469,75 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
     ASSERT_TRUE(phase.policyValid);
     ASSERT_EQ(phase.phaseId, "1_19");
 
+    constexpr uint32 TestVendorEntry = 3900002;
+    constexpr uint32 TestItemEntry = 103;
+    auto const previousVendorRows = VendorSourceTestAccess::SnapshotRows(*sObjectMgr, VendorEntry);
+    auto const previousTestVendorRows = VendorSourceTestAccess::SnapshotRows(*sObjectMgr, TestVendorEntry);
+    bool previousStoreItemExisted = false;
+    ItemTemplate const previousStoreItem = VendorSourceTestAccess::SnapshotStoreItem(
+        *sObjectMgr, TestItemEntry, previousStoreItemExisted);
+    struct Cleanup
+    {
+        ObjectMgr& manager;
+        uint32 entry;
+        VendorSourceTestAccess::VendorRowsSnapshot previousRows;
+        uint32 testVendorEntry;
+        VendorSourceTestAccess::VendorRowsSnapshot previousTestVendorRows;
+        uint32 testItemEntry;
+        bool previousStoreItemExisted;
+        ItemTemplate previousStoreItem;
+        ItemTemplate* previousItem{nullptr};
+        ItemTemplate* testItem{nullptr};
+        bool itemReplaced{false};
+        bool storeItemReplaced{false};
+        PyEng::Population::Bridge* provider{nullptr};
+        ~Cleanup()
+        {
+            if (sPythonEngine->IsEnabled())
+                sPythonEngine->Shutdown();
+            if (provider)
+                PyEng::Population::UnregisterBridge(provider);
+            VendorSourceTestAccess::RestoreRows(manager, entry, previousRows);
+            VendorSourceTestAccess::RestoreRows(manager, testVendorEntry, previousTestVendorRows);
+            if (itemReplaced)
+                VendorSourceTestAccess::RestoreItem(manager, testItemEntry, previousItem);
+            if (storeItemReplaced)
+                VendorSourceTestAccess::RestoreStoreItem(
+                    manager, testItemEntry, previousStoreItemExisted, previousStoreItem);
+            delete testItem;
+        }
+    } cleanup{*sObjectMgr, VendorEntry, previousVendorRows, TestVendorEntry, previousTestVendorRows,
+        TestItemEntry, previousStoreItemExisted, previousStoreItem};
+
     VendorSourceTestAccess::ReplaceRows(*sObjectMgr, VendorEntry, {
         VendorItem(ItemEntry, 3, 45, 0, VendorItemSourceKind::NpcVendorRow, SourceSlot),
         VendorItem(1999999998, 0, 0, 0, VendorItemSourceKind::VendorReferenceExpansion),
         VendorItem(1999999997, 0, 0, 0, VendorItemSourceKind::Runtime)
     });
+    VendorSourceTestAccess::ReplaceRows(*sObjectMgr, TestVendorEntry, {
+        VendorItem(TestItemEntry, 0, 0, 0, VendorItemSourceKind::NpcVendorRow, SourceSlot)
+    });
+    cleanup.testItem = new ItemTemplate{};
+    ItemTemplate* const testItem = cleanup.testItem;
+    testItem->ItemId = TestItemEntry;
+    testItem->Class = ITEM_CLASS_ARMOR;
+    testItem->SubClass = ITEM_SUBCLASS_ARMOR_SHIELD;
+    testItem->Quality = ITEM_QUALITY_UNCOMMON;
+    testItem->BuyCount = 1;
+    testItem->BuyPrice = 100;
+    testItem->InventoryType = INVTYPE_SHIELD;
+    testItem->AllowableClass = 1u << (CLASS_WARRIOR - 1);
+    testItem->AllowableRace = 0xffffffff;
+    testItem->ItemLevel = 15;
+    testItem->RequiredLevel = 1;
+    testItem->Stackable = 1;
+    testItem->StatsCount = 1;
+    testItem->ItemStat[0].ItemStatType = ITEM_MOD_STAMINA;
+    testItem->ItemStat[0].ItemStatValue = 20;
+    cleanup.previousItem = VendorSourceTestAccess::ReplaceItem(*sObjectMgr, TestItemEntry, testItem);
+    cleanup.itemReplaced = true;
+    VendorSourceTestAccess::ReplaceStoreItem(*sObjectMgr, TestItemEntry, *testItem);
+    cleanup.storeItemReplaced = true;
     VendorItemData const* const shiftedList = sObjectMgr->GetNpcVendorItemList(VendorEntry);
     ASSERT_NE(shiftedList, nullptr);
     ASSERT_EQ(shiftedList->GetItemCount(), 3u);
@@ -310,26 +545,238 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
     EXPECT_EQ(shiftedList->GetItem(0)->sourceSlot, SourceSlot)
         << "the loaded-list index 0 must remain distinct from the original npc_vendor slot 37";
     RegisterPythonPopulationBridge();
-    PyEng::Population::Bridge* const registeredProvider = PyEng::Population::GetBridge();
-    ASSERT_NE(registeredProvider, nullptr);
-
-    struct Cleanup
-    {
-        ObjectMgr& manager;
-        uint32 entry;
-        PyEng::Population::Bridge* provider;
-        ~Cleanup()
-        {
-            if (sPythonEngine->IsEnabled())
-                sPythonEngine->Shutdown();
-            if (provider)
-                PyEng::Population::UnregisterBridge(provider);
-            VendorSourceTestAccess::ClearRows(manager, entry);
-        }
-    } cleanup{*sObjectMgr, VendorEntry, registeredProvider};
+    cleanup.provider = PyEng::Population::GetBridge();
+    ASSERT_NE(cleanup.provider, nullptr);
 
     sPythonEngine->Initialize();
     ASSERT_TRUE(sPythonEngine->IsEnabled());
+    ASSERT_TRUE(sPythonEngine->LoadScripts());
+
+    constexpr ObjectGuid::LowType GearActorGuid = 180;
+    constexpr ObjectGuid::LowType GearVendorGuid = 181;
+    constexpr uint32 TestDisplayId = 0;
+    constexpr uint32 TestModelId = 0;
+    std::string const gearIdentity(64, 'c');
+    bool const previousBotConfigEnabled = sPlayerbotAIConfig.enabled;
+    float const previousSightDistance = sPlayerbotAIConfig.sightDistance;
+    std::vector<uint32> const previousRandomAccounts = sPlayerbotAIConfig.randomBotAccounts;
+    ASSERT_NE(sCharacterCache, nullptr);
+    ObjectGuid const gearActorGuid = ObjectGuid::Create<HighGuid::Player>(GearActorGuid);
+    bool const previousCurrentBot = VendorSourceTestAccess::HasCurrentBot(sRandomPlayerbotMgr, GearActorGuid);
+    bool previousHadEventCache = false;
+    BotEventCache previousEventCache = VendorSourceTestAccess::SnapshotEventCache(
+        sRandomPlayerbotMgr, GearActorGuid, previousHadEventCache);
+    CharacterCacheEntry const* const previousGuidCache = sCharacterCache->GetCharacterCacheByGuid(gearActorGuid);
+    CharacterCacheEntry const* const previousNameCache = sCharacterCache->GetCharacterCacheByName("Cpi211TestGearActor");
+    struct GearActorCleanup
+    {
+        TestMap* map;
+        TestPlayer* player;
+        TestCreature* vendor;
+        std::string identity;
+        bool previousBotConfigEnabled;
+        bool previousNewRpgStrategyEnabled;
+        float previousSightDistance;
+        std::vector<uint32> previousRandomAccounts;
+        uint32 currentBotGuid;
+        bool previousCurrentBot;
+        bool previousHadEventCache;
+        BotEventCache previousEventCache;
+        CharacterCacheEntry const* previousGuidCache;
+        CharacterCacheEntry const* previousNameCache;
+        uint32 testDisplayId;
+        uint32 testModelId;
+        bool playerInMap{false};
+        bool vendorInMap{false};
+        bool vendorStored{false};
+        bool objectAccessorRegistered{false};
+        bool fakeDisplayRowsInstalled{false};
+        bool playerbotAdded{false};
+        bool cacheAdded{false};
+        bool actorRegistered{false};
+        bool cleaned{false};
+        void Cleanup()
+        {
+            if (cleaned)
+                return;
+            cleaned = true;
+            // Drop the population callback and its Python globals before the fixture actor/session dies.
+            if (sPythonEngine && sPythonEngine->IsEnabled())
+                sPythonEngine->Shutdown();
+            if (player)
+            {
+                if (actorRegistered)
+                    UnregisterCpi211TestOnlyPopulationActor(identity, player);
+                if (playerbotAdded)
+                {
+                    PlayerbotAI* const ai = sPlayerbotsMgr.GetPlayerbotAI(player);
+                    sPlayerbotsMgr.RemovePlayerBotData(player->GetGUID(), true);
+                    delete ai;
+                }
+                if (cacheAdded && sCharacterCache && !previousGuidCache && !previousNameCache)
+                    sCharacterCache->DeleteCharacterCacheEntry(player->GetGUID(), player->GetName());
+                if (objectAccessorRegistered)
+                    ObjectAccessor::RemoveObject(static_cast<Player*>(player));
+                if (playerInMap)
+                    map->RemovePlayerFromMap(player, false);
+            }
+            VendorSourceTestAccess::SetCurrentBotMembership(sRandomPlayerbotMgr, currentBotGuid, previousCurrentBot);
+            VendorSourceTestAccess::RestoreEventCache(sRandomPlayerbotMgr, currentBotGuid,
+                previousHadEventCache, std::move(previousEventCache));
+            if (vendor && vendorInMap)
+            {
+                // TestCreature::RemoveFromWorld is intentionally a no-op; the
+                // fixture set this flag for map lookup after AddToMap.
+                vendor->SetInWorld(false);
+                map->RemoveFromMap(static_cast<Creature*>(vendor), false);
+                if (vendorStored)
+                    map->GetObjectsStore().Remove<Creature>(vendor->GetGUID());
+            }
+            if (fakeDisplayRowsInstalled)
+            {
+                sCreatureDisplayInfoStore.SetEntry(testDisplayId, nullptr);
+                sCreatureModelDataStore.SetEntry(testModelId, nullptr);
+            }
+            sPlayerbotAIConfig.enabled = previousBotConfigEnabled;
+            sPlayerbotAIConfig.enableNewRpgStrategy = previousNewRpgStrategyEnabled;
+            sPlayerbotAIConfig.sightDistance = previousSightDistance;
+            sPlayerbotAIConfig.randomBotAccounts = std::move(previousRandomAccounts);
+            player = nullptr;
+            vendor = nullptr;
+        }
+        ~GearActorCleanup() { Cleanup(); }
+    } gearActorCleanup{GetTestMap(), nullptr, nullptr, gearIdentity,
+        previousBotConfigEnabled, sPlayerbotAIConfig.enableNewRpgStrategy, previousSightDistance,
+        previousRandomAccounts, GearActorGuid, previousCurrentBot,
+        previousHadEventCache, std::move(previousEventCache), previousGuidCache, previousNameCache,
+        TestDisplayId, TestModelId};
+
+    ASSERT_EQ(sCreatureDisplayInfoStore.LookupEntry(TestDisplayId), nullptr);
+    ASSERT_EQ(sCreatureModelDataStore.LookupEntry(TestModelId), nullptr);
+    auto* const testDisplay = new CreatureDisplayInfoEntry{};
+    testDisplay->Displayid = TestDisplayId;
+    testDisplay->ModelId = TestModelId;
+    testDisplay->scale = 1.0f;
+    auto* const testModel = new CreatureModelDataEntry{};
+    testModel->Id = TestModelId;
+    testModel->Scale = 1.0f;
+    testModel->CollisionWidth = 1.0f;
+    testModel->CollisionHeight = 2.0f;
+    sCreatureDisplayInfoStore.SetEntry(TestDisplayId, testDisplay);
+    sCreatureModelDataStore.SetEntry(TestModelId, testModel);
+    gearActorCleanup.fakeDisplayRowsInstalled = true;
+
+    TestPlayer* const gearActor = CreateTestPlayer(GearActorGuid, "Cpi211TestGearActor");
+    gearActorCleanup.player = gearActor;
+    TestCreature* const gearVendor = CreateTestCreature(GearVendorGuid, TestVendorEntry,
+        TEST_FACTION_HOSTILE_TO_MONSTERS);
+    gearActorCleanup.vendor = gearVendor;
+    ASSERT_EQ(previousGuidCache, nullptr);
+    ASSERT_EQ(previousNameCache, nullptr);
+    EXPECT_FALSE(previousCurrentBot);
+    ASSERT_NE(gearActor, nullptr);
+    ASSERT_NE(gearVendor, nullptr);
+    gearVendor->SetUInt32Value(OBJECT_FIELD_ENTRY, TestVendorEntry);
+    ASSERT_EQ(gearVendor->GetEntry(), TestVendorEntry);
+    gearActor->SetNativeDisplayId(TestDisplayId);
+    gearActor->SetDisplayId(TestDisplayId);
+    gearVendor->SetNativeDisplayId(TestDisplayId);
+    gearVendor->SetDisplayId(TestDisplayId);
+    ASSERT_EQ(sRandomPlayerbotMgr.GetPlayerBot(gearActor->GetGUID()), nullptr);
+    ASSERT_EQ(sPlayerbotsMgr.GetPlayerbotAI(gearActor), nullptr);
+    ASSERT_GT(gearActor->GetSession()->GetPartySessionIncarnation(), 0u);
+    gearActor->SetByteValue(UNIT_FIELD_BYTES_0, 1, CLASS_WARRIOR);
+    gearActor->setRace(RACE_HUMAN);
+    ASSERT_EQ(gearActor->getClass(), CLASS_WARRIOR);
+    gearActor->SetUInt32Value(UNIT_FIELD_FACTIONTEMPLATE, TEST_FACTION_HOSTILE_TO_MONSTERS);
+    gearActor->SetLevel(8);
+    // Seed fixture state without dispatching unrelated achievement-script hooks.
+    gearActor->SetUInt32Value(PLAYER_FIELD_COINAGE, 1000);
+    gearActor->Relocate(0.0f, 0.0f, 0.0f, 0.0f);
+    ASSERT_EQ(gearActor->GetMap(), GetTestMap());
+    ASSERT_TRUE(gearActor->IsInWorld());
+    ASSERT_EQ(ObjectAccessor::FindPlayer(gearActorGuid), nullptr);
+    // CharacterHandler registers the session actor in ObjectAccessor before
+    // adding it to the map. TestPlayer intentionally bypasses that path.
+    ObjectAccessor::AddObject(static_cast<Player*>(gearActor));
+    gearActorCleanup.objectAccessorRegistered = true;
+    ASSERT_EQ(ObjectAccessor::FindPlayer(gearActorGuid), gearActor);
+    // CreateTestPlayer marks the object in-world before it has map-grid
+    // membership. Let AddPlayerToMap perform the single normal registration.
+    gearActor->RemoveFromWorld();
+    ASSERT_FALSE(gearActor->IsInWorld());
+    ASSERT_TRUE(GetTestMap()->AddPlayerToMap(gearActor));
+    gearActorCleanup.playerInMap = true;
+    gearVendor->Relocate(1.0f, 0.0f, 0.0f, 0.0f);
+    gearVendor->SetNpcFlag(UNIT_NPC_FLAG_VENDOR);
+    ASSERT_TRUE(gearVendor->IsInWorld());
+    // CreateTestCreature sets the world flag but does not add the creature to
+    // the grid. Let AddToMap perform that registration exactly once.
+    gearVendor->SetInWorld(false);
+    ASSERT_FALSE(gearVendor->IsInWorld());
+    ASSERT_TRUE(GetTestMap()->AddToMap(static_cast<Creature*>(gearVendor)));
+    gearActorCleanup.vendorInMap = true;
+    // TestCreature intentionally suppresses Creature::AddToWorld. Restore its
+    // controlled world flag and map GUID lookup entry after grid insertion.
+    ASSERT_EQ(GetTestMap()->GetCreature(gearVendor->GetGUID()), nullptr);
+    gearVendor->SetInWorld(true);
+    GetTestMap()->GetObjectsStore().Insert<Creature>(gearVendor->GetGUID(), gearVendor);
+    gearActorCleanup.vendorStored = true;
+    sPlayerbotAIConfig.enabled = true;
+    sPlayerbotAIConfig.enableNewRpgStrategy = true;
+    // PlayerbotAIConfig::Initialize normally loads this before creating value
+    // contexts; the native integration fixture bypasses that server startup.
+    sPlayerbotAIConfig.sightDistance = 20.0f;
+    if (!sPlayerbotAIConfig.IsInRandomAccountList(gearActor->GetSession()->GetAccountId()))
+        sPlayerbotAIConfig.randomBotAccounts.push_back(gearActor->GetSession()->GetAccountId());
+    // The test has no PlayerbotsDatabase connection. Seed the same in-memory
+    // event-cache state used after a production read, with no specNo event so
+    // the real IsSpecPvp path remains false without attempting SQL.
+    VendorSourceTestAccess::SetEventCache(sRandomPlayerbotMgr, GearActorGuid, BotEventCache{true, {}});
+    sCharacterCache->AddCharacterCacheEntry(gearActor->GetGUID(), gearActor->GetSession()->GetAccountId(),
+        gearActor->GetName(), gearActor->getGender(), gearActor->getRace(), gearActor->getClass(), gearActor->GetLevel());
+    gearActorCleanup.cacheAdded = true;
+    // Production initializes the shared Playerbot value/strategy contexts from
+    // PlayerbotAIConfig::Initialize; the unit-test harness does not run that
+    // startup path. Initialize them once before constructing the fixture AI.
+    static bool sharedAiContextsInitialized = false;
+    if (!sharedAiContextsInitialized)
+    {
+        AiObjectContext::BuildAllSharedContexts();
+        sharedAiContextsInitialized = true;
+    }
+    sPlayerbotsMgr.AddPlayerbotData(gearActor, true);
+    gearActorCleanup.playerbotAdded = true;
+    PlayerbotAI* const gearAI = sPlayerbotsMgr.GetPlayerbotAI(gearActor);
+    ASSERT_NE(gearAI, nullptr);
+    gearAI->ChangeStrategy("+new rpg", BOT_STATE_NON_COMBAT);
+    ASSERT_TRUE(gearAI->HasStrategy("new rpg", BOT_STATE_NON_COMBAT));
+    ASSERT_NE(gearAI->GetAiObjectContext(), nullptr);
+    auto* const nearestNpcs = gearAI->GetAiObjectContext()->GetValue<GuidVector>("nearest npcs");
+    ASSERT_NE(nearestNpcs, nullptr);
+    ASSERT_TRUE(gearVendor->IsInGrid());
+    EXPECT_TRUE(gearActor->InSamePhase(gearVendor));
+    EXPECT_TRUE(gearActor->IsWithinDistInMap(gearVendor, sPlayerbotAIConfig.sightDistance));
+    EXPECT_TRUE(gearActor->IsWithinLOSInMap(gearVendor));
+    GuidVector const nearbyVendorGuids = nearestNpcs->Get();
+    ASSERT_NE(std::find(nearbyVendorGuids.begin(), nearbyVendorGuids.end(), gearVendor->GetGUID()),
+        nearbyVendorGuids.end());
+    ASSERT_FALSE(gearAI->rpgInfo.pythonQuestGoal);
+    ASSERT_TRUE(std::holds_alternative<NewRpgInfo::Idle>(gearAI->rpgInfo.data));
+    ASSERT_EQ(gearActor->GetSession()->GetCurrentVendor(), 0u);
+    ASSERT_EQ(gearActor->GetNPCIfCanInteractWith(gearVendor->GetGUID(), UNIT_NPC_FLAG_VENDOR), gearVendor);
+    ASSERT_NE(gearVendor->GetVendorItems(), nullptr);
+    ASSERT_EQ(gearVendor->GetVendorItems()->GetItemCount(), 1u);
+    ASSERT_EQ(gearVendor->GetVendorItems()->GetItem(0)->sourceSlot, SourceSlot);
+    EXPECT_FALSE(sRandomPlayerbotMgr.IsRandomBot(gearActor));
+    EXPECT_FALSE(RegisterCpi211TestOnlyPopulationActor(gearIdentity, gearActor))
+        << "an ordinary bot identity without scheduler membership must remain inadmissible";
+    // The fixture helper is the sole test path into scheduler membership; the
+    // production IsRandomBot and admission checks remain unchanged.
+    VendorSourceTestAccess::SetCurrentBotMembership(sRandomPlayerbotMgr, GearActorGuid, true);
+    EXPECT_TRUE(sRandomPlayerbotMgr.IsRandomBot(gearActor));
+    ASSERT_TRUE(RegisterCpi211TestOnlyPopulationActor(gearIdentity, gearActor));
+    gearActorCleanup.actorRegistered = true;
 
     // Exercise the real PythonCreatureScript -> ScriptMgr global dispatch and
     // its native per-entry fallback with registered callbacks. This covers
@@ -505,8 +952,8 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
         "assert loaded_enum['coverage']['runtime_rows'] >= 1\n"
         "import os, pathlib, sys\n"
         "native_test_root = pathlib.Path(os.environ['CPI211_NATIVE_TEST_ROOT'])\n"
-        "task_root = native_test_root.parents[4]\n"
-        "compiled_package_dir = native_test_root.parents[1] / 'gear-consumer-package'\n"
+        "task_root = pathlib.Path(os.environ['CPI211_TASK_ROOT'])\n"
+        "compiled_package_dir = pathlib.Path(os.environ['CPI211_COMPILED_PACKAGE_DIR'])\n"
         "package_dir = task_root / 'worker/wow-private-server/tools/playerbots-strategic-director'\n"
         "consumer_dir = task_root / 'worker/wow-private-server/integration/cpi-225-native-earned-upgrade-20261021/runtime/population/python/lib'\n"
         "os.environ['PBGUIDE_TEST_PACKAGE_DIR'] = str(package_dir)\n"
@@ -516,7 +963,6 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
         "sys.path.insert(0, str(compiled_package_dir))\n"
         "sys.path.insert(0, str(package_dir))\n"
         "import test_native_acquisition_v2_consumer as v2_consumer_test\n"
-        "v2_consumer_test.run_embedded_compiled_provider_consumer(ac)\n"
         "for bad_cap in [0, True, '16384', 16385]:\n"
         "    try:\n"
         "        ac.strategic_enumerate_loaded_vendor_sources(bad_cap)\n"
@@ -528,6 +974,58 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
         "assert partial['native_source_snapshot_id'] is None\n"
         "assert partial['copied_rows'] == 1 and partial['row_cap'] == 1\n");
     ASSERT_TRUE(initial) << initial.error;
+
+    auto const bootstrapSetup = sPythonEngine->ExecuteCode(
+        "cpi211_test_witness = None\n"
+        "cpi211_test_actor_identity = '" + gearIdentity + "'\n"
+        "cpi211_test_gear_snapshot = None\n"
+        "cpi211_test_probe_removed_identity = False\n"
+        "cpi211_removed_identity = None\n"
+        "cpi211_population_tick_result = None\n");
+    ASSERT_TRUE(bootstrapSetup) << bootstrapSetup.error;
+    EXPECT_TRUE(sPythonEngine->RunPopulationTick(1));
+    auto const bootstrapReadback = sPythonEngine->ExecuteCode(
+        "assert cpi211_population_tick_result is True, repr(cpi211_population_tick_result)\n"
+        "assert cpi211_test_gear_snapshot is not None, repr(cpi211_test_gear_snapshot)\n"
+        "assert cpi211_test_gear_snapshot['control_allowed'] is True, repr(cpi211_test_gear_snapshot)\n"
+        "assert cpi211_test_gear_snapshot['class_id'] == 1, repr(cpi211_test_gear_snapshot)\n");
+    ASSERT_TRUE(bootstrapReadback) << bootstrapReadback.error;
+
+    AchievementHookRegistryFixture achievementHookRegistryFixture;
+    auto const stagedTestConsumer = sPythonEngine->ExecuteCode(
+        "cpi211_test_witness = v2_consumer_test.run_embedded_compiled_provider_consumer(ac, '" + gearIdentity + "', cpi211_test_gear_snapshot)\n"
+        "cpi211_population_tick_result = None\n"
+        "cpi211_population_tick_error = None\n"
+        "cpi211_replay_result = None\n");
+    ASSERT_TRUE(stagedTestConsumer) << stagedTestConsumer.error;
+    EXPECT_TRUE(sPythonEngine->RunPopulationTick(1));
+    auto const consumerTickDiagnostic = sPythonEngine->ExecuteCode(
+        "assert cpi211_population_tick_result is True, repr((cpi211_population_tick_result, cpi211_population_tick_error, cpi211_test_witness.status, cpi211_test_witness._cpi211_test_audit_rows))\n"
+        "assert cpi211_population_tick_error is None, repr((cpi211_population_tick_error, cpi211_test_witness.status, cpi211_test_witness._cpi211_test_audit_rows))\n");
+    ASSERT_TRUE(consumerTickDiagnostic) << consumerTickDiagnostic.error;
+    auto const testConsumerReceipt = sPythonEngine->ExecuteCode(
+        "assert cpi211_population_tick_result is True, repr((cpi211_population_tick_result, cpi211_population_tick_error))\n"
+        "assert cpi211_native_offer['source_id'] == 'vendor:3900002:slot:0:item:103:cost:0'\n"
+        "assert len(cpi211_native_offer['request_id']) == 64 and all(character in '0123456789abcdef' for character in cpi211_native_offer['request_id'])\n"
+        "assert any(character in 'abcdef' for character in cpi211_native_offer['request_id'])\n"
+        "assert cpi211_native_offer['request_id'] == [row for row in cpi211_test_witness._cpi211_test_audit_rows if row.get('event') == 'vendor_purchase'][0]['native_receipt']['request_id']\n"
+        "assert cpi211_test_witness.status['reason'] == ''\n"
+        "assert type(cpi211_test_witness.strategy) is v2_consumer_test.GearPolicy, repr((type(cpi211_test_witness.strategy), v2_consumer_test.GearPolicy, type(cpi211_test_witness.strategy).__module__, getattr(__import__(type(cpi211_test_witness.strategy).__module__), '__file__', None)))\n"
+        "plans = [row for row in cpi211_test_witness._cpi211_test_audit_rows if row.get('event') == 'gear_recommendation']\n"
+        "assert len(plans) == 1 and plans[0]['plan']['selected_source_id'] == 'source:03'\n"
+        "assert plans[0]['plan']['selected_target_id'] == 'target:item-103-slot-16'\n"
+        "purchases = [row for row in cpi211_test_witness._cpi211_test_audit_rows if row.get('event') == 'vendor_purchase']\n"
+        "assert len(purchases) == 1\n"
+        "assert purchases[0]['source_id'] == 'source:03' and purchases[0]['target']['slot'] == 16\n"
+        "receipt = purchases[0]['native_receipt']\n"
+        "assert receipt['status'] == 'committed' and receipt['item'] == 103, repr(receipt)\n"
+        "assert receipt['money_before'] - receipt['money_after'] == receipt['price_copper'] == 100\n"
+        "assert receipt['item_before'] == 0 and receipt['item_after'] == 1 and receipt['item_guid'] > 0\n"
+        "assert cpi211_replay_result['status'] == 'refused_before_effect'\n"
+        "assert cpi211_replay_result['reason'] != ''\n");
+    ASSERT_TRUE(testConsumerReceipt) << testConsumerReceipt.error;
+    EXPECT_EQ(gearActor->GetMoney(), 900u);
+    EXPECT_EQ(gearActor->GetItemCount(TestItemEntry, false), 1u);
 
     auto const negativeCases = sPythonEngine->ExecuteCode(
         "missing = ac.strategic_read_loaded_source_snapshot([{'source_table':'npc_vendor','natural_key':{'entry':3900001,'slot':38,'item':1999999999}}])\n"
@@ -619,4 +1117,18 @@ TEST_F(IntegrationTestFixture, UsesProductionProviderBindingAndCurrentObjectMgrR
         "assert enum_refused['valid'] is False and enum_refused['complete'] is False\n"
         "assert enum_refused['native_source_snapshot_id'] is None\n");
     EXPECT_TRUE(phaseRefusal) << phaseRefusal.error;
+
+    UnregisterCpi211TestOnlyPopulationActor(gearIdentity, gearActor);
+    gearActorCleanup.actorRegistered = false;
+    auto const removedIdentityProbe = sPythonEngine->ExecuteCode("cpi211_test_probe_removed_identity = True\n");
+    ASSERT_TRUE(removedIdentityProbe) << removedIdentityProbe.error;
+    EXPECT_TRUE(sPythonEngine->RunPopulationTick(1));
+    auto const fixtureIdentityRemoval = sPythonEngine->ExecuteCode(
+        "assert cpi211_removed_identity['reason'] == 'not_admitted'\n");
+    EXPECT_TRUE(fixtureIdentityRemoval) << fixtureIdentityRemoval.error;
+    gearActorCleanup.Cleanup();
+    EXPECT_EQ(sCharacterCache->GetCharacterCacheByGuid(ObjectGuid::Create<HighGuid::Player>(GearActorGuid)), previousGuidCache);
+    EXPECT_EQ(sCharacterCache->GetCharacterCacheByName("Cpi211TestGearActor"), previousNameCache);
+    EXPECT_EQ(sRandomPlayerbotMgr.GetPlayerBot(GearActorGuid), nullptr);
+    EXPECT_EQ(VendorSourceTestAccess::HasCurrentBot(sRandomPlayerbotMgr, GearActorGuid), previousCurrentBot);
 }
