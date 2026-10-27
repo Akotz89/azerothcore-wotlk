@@ -76,6 +76,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include "LootReceipt.h"
 
 float baseMoveSpeed[MAX_MOVE_TYPE] =
 {
@@ -14073,6 +14074,11 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
         {
             Loot* loot = &creature->loot;
             loot->clear();
+            loot->receiptGeneration = LootReceipt::Next();
+            loot->receiptMapId = creature->GetMapId();
+            loot->receiptInstanceId = creature->GetInstanceId();
+            LootReceipt::Emit("loot_v1 generation_begin generation={} corpse={} map={} instance={}",
+                loot->receiptGeneration, creature->GetGUID().GetRawValue(), creature->GetMapId(), creature->GetInstanceId());
 
             if (uint32 lootid = creature->GetCreatureTemplate()->lootid)
                 loot->FillLoot(lootid, LootTemplates_Creature, looter, false, false, creature->GetLootMode(), creature);

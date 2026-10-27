@@ -729,6 +729,7 @@ class PlayerDumpReader;
 class ObjectMgr
 {
     friend class PlayerDumpReader;
+    friend class VendorSourceTestAccess;
 
 private:
     ObjectMgr();

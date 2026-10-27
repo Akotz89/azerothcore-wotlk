@@ -441,20 +441,38 @@ struct CreatureAddon
 typedef std::unordered_map<uint32, CreatureAddon> CreatureAddonContainer;
 
 // Vendors
+enum class VendorItemSourceKind : uint8
+{
+    Unknown,
+    NpcVendorRow,
+    VendorReferenceExpansion,
+    Runtime
+};
+
 struct VendorItem
 {
-    VendorItem(uint32 _item, int32 _maxcount, uint32 _incrtime, uint32 _ExtendedCost)
-        : item(_item), maxcount(_maxcount), incrtime(_incrtime), ExtendedCost(_ExtendedCost) {}
+    VendorItem(uint32 _item, int32 _maxcount, uint32 _incrtime, uint32 _ExtendedCost,
+               VendorItemSourceKind _sourceKind = VendorItemSourceKind::Unknown, uint32 _sourceSlot = 0)
+        : item(_item), maxcount(_maxcount), incrtime(_incrtime), ExtendedCost(_ExtendedCost),
+          sourceKind(_sourceKind), sourceSlot(_sourceSlot) {}
 
     uint32 item;
     uint32  maxcount;                                       // 0 for infinity item amount
     uint32 incrtime;                                        // time for restore items amount if maxcount != 0
     uint32 ExtendedCost;
+    VendorItemSourceKind sourceKind{VendorItemSourceKind::Unknown};
+    uint32 sourceSlot{0}; // meaningful only when sourceKind == NpcVendorRow; never a vector index
 
     //helpers
     bool IsGoldRequired(ItemTemplate const* pProto) const { return pProto->HasFlag2(ITEM_FLAG2_DONT_IGNORE_BUY_PRICE) || !ExtendedCost; }
 };
 typedef std::vector<VendorItem*> VendorItemList;
+
+struct VendorItemSourceLookup
+{
+    VendorItem const* item{nullptr};
+    uint32 matchCount{0};
+};
 
 struct VendorItemData
 {
@@ -469,9 +487,26 @@ struct VendorItemData
     }
     [[nodiscard]] bool Empty() const { return m_items.empty(); }
     [[nodiscard]] uint8 GetItemCount() const { return m_items.size(); }
-    void AddItem(uint32 item, int32 maxcount, uint32 ptime, uint32 ExtendedCost)
+    void AddItem(uint32 item, int32 maxcount, uint32 ptime, uint32 ExtendedCost,
+                 VendorItemSourceKind sourceKind = VendorItemSourceKind::Unknown, uint32 sourceSlot = 0)
     {
-        m_items.push_back(new VendorItem(item, maxcount, ptime, ExtendedCost));
+        m_items.push_back(new VendorItem(item, maxcount, ptime, ExtendedCost, sourceKind, sourceSlot));
+    }
+    [[nodiscard]] VendorItemSourceLookup FindNpcVendorRow(uint32 sourceSlot, uint32 item) const
+    {
+        VendorItemSourceLookup result;
+        for (VendorItem const* candidate : m_items)
+        {
+            if (!candidate || candidate->sourceKind != VendorItemSourceKind::NpcVendorRow ||
+                candidate->sourceSlot != sourceSlot || candidate->item != item)
+                continue;
+
+            if (result.matchCount++ == 0)
+                result.item = candidate;
+            else
+                result.item = nullptr;
+        }
+        return result;
     }
     bool RemoveItem(uint32 item_id);
     [[nodiscard]] VendorItem const* FindItemCostPair(uint32 item_id, uint32 extendedCost) const;

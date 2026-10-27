@@ -37,8 +37,15 @@ bool ScriptMgr::OnQuestAccept(Player* player, Item* item, Quest const* quest)
         return false;
     }
 
-    auto tempScript = ScriptRegistry<ItemScript>::GetScriptById(item->GetScriptId());
     ClearGossipMenuFor(player);
+    auto handled = IsValidBoolScript<AllItemScript>([&](AllItemScript* script)
+    {
+        return script->OnItemQuestAccept(player, item, quest);
+    });
+    if (handled && *handled)
+        return true;
+
+    auto tempScript = ScriptRegistry<ItemScript>::GetScriptById(item->GetScriptId());
     return tempScript ? tempScript->OnQuestAccept(player, item, quest) : false;
 }
 
@@ -76,6 +83,13 @@ bool ScriptMgr::OnItemExpire(Player* player, ItemTemplate const* proto)
         return false;
     }
 
+    auto handled = IsValidBoolScript<AllItemScript>([&](AllItemScript* script)
+    {
+        return script->OnItemExpire(player, proto);
+    });
+    if (handled && *handled)
+        return true;
+
     auto tempScript = ScriptRegistry<ItemScript>::GetScriptById(proto->ScriptId);
     return tempScript ? tempScript->OnExpire(player, proto) : false;
 }
@@ -95,6 +109,13 @@ bool ScriptMgr::OnItemRemove(Player* player, Item* item)
         return false;
     }
 
+    auto handled = IsValidBoolScript<AllItemScript>([&](AllItemScript* script)
+    {
+        return script->OnItemRemove(player, item);
+    });
+    if (handled && *handled)
+        return true;
+
     auto tempScript = ScriptRegistry<ItemScript>::GetScriptById(item->GetScriptId());
     return tempScript ? tempScript->OnRemove(player, item) : false;
 }
@@ -105,6 +126,14 @@ bool ScriptMgr::OnCastItemCombatSpell(Player* player, Unit* victim, SpellInfo co
     ASSERT(victim);
     ASSERT(spellInfo);
     ASSERT(item);
+
+    bool canCast = true;
+    ExecuteScript<AllItemScript>([&](AllItemScript* script)
+    {
+        canCast = script->CanItemCastCombatSpell(player, victim, spellInfo, item) && canCast;
+    });
+    if (!canCast)
+        return false;
 
     auto tempScript = ScriptRegistry<ItemScript>::GetScriptById(item->GetScriptId());
     return tempScript ? tempScript->OnCastItemCombatSpell(player, victim, spellInfo, item) : true;

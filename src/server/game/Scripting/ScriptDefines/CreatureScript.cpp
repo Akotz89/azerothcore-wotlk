@@ -107,8 +107,15 @@ bool ScriptMgr::OnQuestSelect(Player* player, Creature* creature, Quest const* q
     ASSERT(creature);
     ASSERT(quest);
 
-    auto tempScript = ScriptRegistry<CreatureScript>::GetScriptById(creature->GetScriptId());
     ClearGossipMenuFor(player);
+    auto ret = IsValidBoolScript<AllCreatureScript>([&](AllCreatureScript* script)
+    {
+        return script->OnCreatureQuestSelect(player, creature, quest);
+    });
+    if (ret && *ret)
+        return true;
+
+    auto tempScript = ScriptRegistry<CreatureScript>::GetScriptById(creature->GetScriptId());
     return tempScript ? tempScript->OnQuestSelect(player, creature, quest) : false;
 }
 
@@ -118,8 +125,15 @@ bool ScriptMgr::OnQuestComplete(Player* player, Creature* creature, Quest const*
     ASSERT(creature);
     ASSERT(quest);
 
-    auto tempScript = ScriptRegistry<CreatureScript>::GetScriptById(creature->GetScriptId());
     ClearGossipMenuFor(player);
+    auto ret = IsValidBoolScript<AllCreatureScript>([&](AllCreatureScript* script)
+    {
+        return script->OnCreatureQuestComplete(player, creature, quest);
+    });
+    if (ret && *ret)
+        return true;
+
+    auto tempScript = ScriptRegistry<CreatureScript>::GetScriptById(creature->GetScriptId());
     return tempScript ? tempScript->OnQuestComplete(player, creature, quest) : false;
 }
 
@@ -139,8 +153,15 @@ bool ScriptMgr::OnQuestReward(Player* player, Creature* creature, Quest const* q
         return false;
     }
 
-    auto tempScript = ScriptRegistry<CreatureScript>::GetScriptById(creature->GetScriptId());
     ClearGossipMenuFor(player);
+    auto handled = IsValidBoolScript<AllCreatureScript>([&](AllCreatureScript* script)
+    {
+        return script->OnCreatureQuestReward(player, creature, quest, opt);
+    });
+    if (handled && *handled)
+        return true;
+
+    auto tempScript = ScriptRegistry<CreatureScript>::GetScriptById(creature->GetScriptId());
     return tempScript ? tempScript->OnQuestReward(player, creature, quest, opt) : false;
 }
 

@@ -680,12 +680,14 @@ public:
         return true;
     }
 
-    bool OnQuestComplete(Player* /*player*/, Creature* creature, Quest const* quest) override
+    bool OnQuestReward(Player* /*player*/, Creature* creature, Quest const* quest, uint32 /*opt*/) override
     {
         if (quest->GetQuestId() == QUEST_CLUCK)
             CAST_AI(npc_chicken_cluck::npc_chicken_cluckAI, creature->AI())->Reset();
 
-        return true;
+        // Keep the questgiver available through the reward dialog; reset the
+        // event only after the reward transaction has succeeded.
+        return false;
     }
 };
 

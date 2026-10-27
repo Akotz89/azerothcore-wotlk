@@ -35,6 +35,8 @@
 #include "SharedDefines.h"
 #include "World.h"
 #include <map>
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <utility>
 
@@ -529,6 +531,33 @@ public:
     void SendPlayTimeWarning(PlayTimeFlag flag, int32 playTimeRemaining);
 
     /// Is the user engaged in a log out process?
+    // Request-local admission only; no callable survives an opcode or enters the spell queue.
+    class NativeMutationScope
+    {
+        WorldSession& session;
+        std::function<bool()> const* previous;
+    public:
+        NativeMutationScope(WorldSession& value, std::function<bool()> const& authorize)
+            : session(value), previous(value.nativeMutationAuthorization) { value.nativeMutationAuthorization = authorize ? &authorize : previous; }
+        ~NativeMutationScope() { session.nativeMutationAuthorization = previous; }
+    };
+    bool IsNativeMutationAuthorized() const noexcept
+    {
+        try { return !nativeMutationAuthorization || !*nativeMutationAuthorization || (*nativeMutationAuthorization)(); }
+        catch (...) { return false; }
+    }
+    void AcceptQuestWithAuthorization(WorldPacket& packet, std::function<bool()> const& authorize)
+    { NativeMutationScope scope(*this, authorize); HandleQuestgiverAcceptQuestOpcode(packet); }
+    void UseItemWithAuthorization(WorldPacket& packet, std::function<bool()> const& authorize)
+    { NativeMutationScope scope(*this, authorize); HandleUseItemOpcode(packet); }
+    void AutoEquipItemSlotWithAuthorization(WorldPackets::Item::AutoEquipItemSlot& packet, std::function<bool()> const& authorize)
+    { NativeMutationScope scope(*this, authorize); HandleAutoEquipItemSlotOpcode(packet); }
+    void InitiateTradeWithAuthorization(WorldPacket& packet, std::function<bool()> const& authorize)
+    { NativeMutationScope scope(*this, authorize); HandleInitiateTradeOpcode(packet); }
+
+    // A session address can be reused; native authority needs a process-unique incarnation.
+    uint64 GetPartySessionIncarnation() const { return partySessionIncarnation; }
+
     bool isLogingOut() const { return _logoutTime || m_playerLogout; }
 
     /// Engage the logout process for the user
@@ -899,6 +928,7 @@ public:                                                 // opcodes handlers
     void HandleInitiateTradeOpcode(WorldPacket& recvPacket);
     void HandleSetTradeGoldOpcode(WorldPacket& recvPacket);
     void HandleSetTradeItemOpcode(WorldPacket& recvPacket);
+    bool TrySetTradeItem(WorldPacket& recvPacket, std::function<bool()> const& authorize = {});
     void HandleUnacceptTradeOpcode(WorldPacket& recvPacket);
 
     void HandleAuctionHelloOpcode(WorldPacket& recvPacket);
@@ -918,6 +948,7 @@ public:                                                 // opcodes handlers
 
     void HandleGetMailList(WorldPacket& recvData);
     void HandleSendMail(WorldPacket& recvData);
+    bool SendMailWithResult(WorldPacket& recvData, std::function<bool()> const& authorize = {});
     void HandleMailTakeMoney(WorldPacket& recvData);
     void HandleMailTakeItem(WorldPacket& recvData);
     void HandleMailMarkAsRead(WorldPacket& recvData);
@@ -934,6 +965,7 @@ public:                                                 // opcodes handlers
     void HandleAutoEquipItemOpcode(WorldPackets::Item::AutoEquipItem& packet);
     void HandleItemQuerySingleOpcode(WorldPacket& recvPacket);
     void HandleSellItemOpcode(WorldPackets::Item::SellItem& packet);
+    uint32 TrySellItem(WorldPackets::Item::SellItem& packet, std::function<bool()> const& authorize = {});
     void HandleBuyItemInSlotOpcode(WorldPackets::Item::BuyItemInSlot& packet);
     void HandleBuyItemOpcode(WorldPackets::Item::BuyItem& packet);
     void HandleListInventoryOpcode(WorldPackets::Item::ListInventory& packet);
@@ -1233,6 +1265,14 @@ public:                                                 // opcodes handlers
     }
 
 private:
+    std::function<bool()> const* nativeMutationAuthorization = nullptr;
+    static uint64 NextPartySessionIncarnation()
+    {
+        static std::atomic<uint64> next{0};
+        return next.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    uint64 const partySessionIncarnation = NextPartySessionIncarnation();
+
     void ProcessQueryCallbacks();
 
     QueryCallbackProcessor _queryProcessor;

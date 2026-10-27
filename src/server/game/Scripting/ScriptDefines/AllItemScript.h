@@ -26,6 +26,14 @@ protected:
     AllItemScript(char const* name);
 
 public:
+    // Global event callbacks return true when handled; false keeps the per-entry fallback.
+    [[nodiscard]] virtual bool OnItemQuestAccept(Player* /*player*/, Item* /*item*/, Quest const* /*quest*/) { return false; }
+    [[nodiscard]] virtual bool OnItemExpire(Player* /*player*/, ItemTemplate const* /*proto*/) { return false; }
+    [[nodiscard]] virtual bool OnItemRemove(Player* /*player*/, Item* /*item*/) { return false; }
+
+    // Global cast permission callbacks are combined with logical AND.
+    [[nodiscard]] virtual bool CanItemCastCombatSpell(Player* /*player*/, Unit* /*victim*/, SpellInfo const* /*spellInfo*/, Item* /*item*/) { return true; }
+
     // Called when a player accepts a quest from the item.
     [[nodiscard]] virtual bool CanItemQuestAccept(Player* /*player*/, Item* /*item*/, Quest const* /*quest*/) { return true; }
 

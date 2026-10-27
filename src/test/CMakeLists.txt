@@ -25,7 +25,6 @@ add_executable(
 
 target_link_libraries(
         unit_tests
-        game
         gtest_main
         gmock_main
         game-interface
@@ -49,6 +48,15 @@ endif()
 # Link modules library to tests so module code is available
 if(TARGET modules)
     target_link_libraries(unit_tests modules)
+    target_link_libraries(unit_tests scripts)
+    target_link_libraries(unit_tests game)
+endif()
+
+# Module-backed Core tests may include Boost.Python headers directly. The
+# modules library keeps these dependencies private, so expose the same
+# interface to the unit-test target without changing other Core consumers.
+if(TARGET pyeng-interface)
+    target_link_libraries(unit_tests pyeng-interface)
 endif()
 
 add_test(
@@ -57,3 +65,5 @@ add_test(
         COMMAND
         ${CMAKE_BINARY_DIR}/src/test/unit_tests
 )
+set_tests_properties(unit PROPERTIES
+    ENVIRONMENT "CPI211_NATIVE_TEST_ROOT=${CMAKE_BINARY_DIR}/cpi211-native-test")

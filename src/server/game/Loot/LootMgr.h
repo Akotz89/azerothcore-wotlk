@@ -320,6 +320,8 @@ struct Loot
     std::vector<LootItem> items;
     std::vector<LootItem> quest_items;
     uint32 gold;
+    uint32 receiptMapId{0}, receiptInstanceId{0};
+    uint64 receiptGeneration{0}; // Passive corpse generation identity, not loot authority.
     uint8 unlootedCount{0};
     ObjectGuid roundRobinPlayer;        // GUID of the player having the Round-Robin ownership for the loot. If 0, round robin owner has released.
     ObjectGuid lootOwnerGUID;
@@ -358,6 +360,8 @@ struct Loot
         items.clear();
         quest_items.clear();
         gold = 0;
+        receiptGeneration = 0;
+        receiptMapId = receiptInstanceId = 0;
         unlootedCount = 0;
         roundRobinPlayer.Clear();
         i_LootValidatorRefMgr.clearReferences();

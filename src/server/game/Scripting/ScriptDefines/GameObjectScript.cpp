@@ -117,8 +117,15 @@ bool ScriptMgr::OnQuestReward(Player* player, GameObject* go, Quest const* quest
         return false;
     }
 
-    auto tempScript = ScriptRegistry<GameObjectScript>::GetScriptById(go->GetScriptId());
     ClearGossipMenuFor(player);
+    auto handled = IsValidBoolScript<AllGameObjectScript>([&](AllGameObjectScript* script)
+    {
+        return script->OnGameObjectQuestReward(player, go, quest, opt);
+    });
+    if (handled && *handled)
+        return true;
+
+    auto tempScript = ScriptRegistry<GameObjectScript>::GetScriptById(go->GetScriptId());
     return tempScript ? tempScript->OnQuestReward(player, go, quest, opt) : false;
 }
 

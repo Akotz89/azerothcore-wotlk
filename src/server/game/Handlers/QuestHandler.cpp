@@ -216,6 +216,11 @@ void WorldSession::HandleQuestgiverQueryQuestOpcode(WorldPacket& recvData)
         return;
     }
 
+    // Apply the same distance and questgiver interaction fence as the other
+    // questgiver packet handlers before invoking any creature selection hook.
+    if (!_player->CanInteractWithQuestGiver(object))
+        return;
+
     if (Quest const* quest = sObjectMgr->GetQuestTemplate(questId))
     {
         // not sure here what should happen to quests with QUEST_FLAGS_AUTOCOMPLETE
@@ -223,6 +228,13 @@ void WorldSession::HandleQuestgiverQueryQuestOpcode(WorldPacket& recvData)
         // item-started quests never have that flag
         if (!_player->CanTakeQuest(quest, true))
             return;
+
+        // A creature script may take over a validated quest selection. Keep
+        // this after the questgiver/relation and eligibility checks above, and
+        // before auto-accept or the default quest dialog is processed.
+        if (Creature* questgiver = object->ToCreature())
+            if (sScriptMgr->OnQuestSelect(_player, questgiver, quest))
+                return;
 
         if (quest->IsAutoAccept() && _player->CanAddQuest(quest, true))
             _player->AddQuestAndCheckCompletion(quest, object);
@@ -504,6 +516,13 @@ void WorldSession::HandleQuestgiverCompleteQuest(WorldPacket& recvData)
         if (Battleground* bg = _player->GetBattleground())
             if (bg->GetBgTypeID(true) == BATTLEGROUND_AV)
                 bg->ToBattlegroundAV()->HandleQuestComplete(questId, _player);
+
+        // This is the validated questgiver dialog-completion request, not the
+        // objective-completion or reward transaction. A handled creature hook
+        // suppresses the ordinary request-items/reward dialog below.
+        if (Creature* questgiver = object->ToCreature())
+            if (sScriptMgr->OnQuestComplete(_player, questgiver, quest))
+                return;
 
         if (_player->GetQuestStatus(questId) != QUEST_STATUS_COMPLETE)
         {

@@ -64,6 +64,9 @@ public:
     // Called when a player accepts a quest from the gameobject.
     [[nodiscard]] virtual bool CanGameObjectQuestAccept(Player* /*player*/, GameObject* /*go*/, Quest const* /*quest*/) { return false; }
 
+    // Return true when a global callback handled this reward; otherwise use the per-entry script.
+    [[nodiscard]] virtual bool OnGameObjectQuestReward(Player* /*player*/, GameObject* /*go*/, Quest const* /*quest*/, uint32 /*opt*/) { return false; }
+
     // Called when a player selects a quest reward.
     [[nodiscard]] virtual bool CanGameObjectQuestReward(Player* /*player*/, GameObject* /*go*/, Quest const* /*quest*/, uint32 /*opt*/) { return false; }
 

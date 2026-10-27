@@ -94,6 +94,11 @@ public:
     // Called when a player accepts a quest from the creature.
     [[nodiscard]] virtual bool CanCreatureQuestAccept(Player* /*player*/, Creature* /*creature*/, Quest const* /*quest*/) { return false; }
 
+    // Global quest callbacks: return true to handle and skip the per-entry script.
+    [[nodiscard]] virtual bool OnCreatureQuestSelect(Player* /*player*/, Creature* /*creature*/, Quest const* /*quest*/) { return false; }
+    [[nodiscard]] virtual bool OnCreatureQuestComplete(Player* /*player*/, Creature* /*creature*/, Quest const* /*quest*/) { return false; }
+    [[nodiscard]] virtual bool OnCreatureQuestReward(Player* /*player*/, Creature* /*creature*/, Quest const* /*quest*/, uint32 /*opt*/) { return false; }
+
     // Called when a player selects a quest reward.
     [[nodiscard]] virtual bool CanCreatureQuestReward(Player* /*player*/, Creature* /*creature*/, Quest const* /*quest*/, uint32 /*opt*/) { return false; }
 

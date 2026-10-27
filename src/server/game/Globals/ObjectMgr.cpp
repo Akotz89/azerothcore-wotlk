@@ -10144,7 +10144,7 @@ int ObjectMgr::LoadReferenceVendor(int32 vendor, int32 item, std::set<uint32>* s
 
             VendorItemData& vList = _cacheVendorItemStore[vendor];
 
-            vList.AddItem(item_id, maxcount, incrtime, ExtendedCost);
+            vList.AddItem(item_id, maxcount, incrtime, ExtendedCost, VendorItemSourceKind::VendorReferenceExpansion);
             ++count;
         }
     } while (result->NextRow());
@@ -10163,7 +10163,7 @@ void ObjectMgr::LoadVendors()
 
     std::set<uint32> skip_vendors;
 
-    QueryResult result = WorldDatabase.Query("SELECT entry, item, maxcount, incrtime, ExtendedCost FROM npc_vendor ORDER BY entry, slot ASC, item, ExtendedCost");
+    QueryResult result = WorldDatabase.Query("SELECT entry, item, slot, maxcount, incrtime, ExtendedCost FROM npc_vendor ORDER BY entry, slot ASC, item, ExtendedCost");
     if (!result)
     {
         LOG_INFO("server.loading", " ");
@@ -10178,23 +10178,24 @@ void ObjectMgr::LoadVendors()
         Field* fields = result->Fetch();
 
         uint32 entry        = fields[0].Get<uint32>();
-        int32 item_id      = fields[1].Get<int32>();
+        int32 item_id       = fields[1].Get<int32>();
+        uint32 sourceSlot   = fields[2].Get<uint32>();
 
         // if item is a negative, its a reference
         if (item_id < 0)
             count += LoadReferenceVendor(entry, -item_id, &skip_vendors);
         else
         {
-            uint32 maxcount     = fields[2].Get<uint32>();
-            uint32 incrtime     = fields[3].Get<uint32>();
-            uint32 ExtendedCost = fields[4].Get<uint32>();
+            uint32 maxcount     = fields[3].Get<uint32>();
+            uint32 incrtime     = fields[4].Get<uint32>();
+            uint32 ExtendedCost = fields[5].Get<uint32>();
 
             if (!IsVendorItemValid(entry, item_id, maxcount, incrtime, ExtendedCost, nullptr, &skip_vendors))
                 continue;
 
             VendorItemData& vList = _cacheVendorItemStore[entry];
 
-            vList.AddItem(item_id, maxcount, incrtime, ExtendedCost);
+            vList.AddItem(item_id, maxcount, incrtime, ExtendedCost, VendorItemSourceKind::NpcVendorRow, sourceSlot);
             ++count;
         }
     } while (result->NextRow());
@@ -10337,7 +10338,7 @@ void ObjectMgr::LoadGossipMenuItems()
 void ObjectMgr::AddVendorItem(uint32 entry, uint32 item, uint32 maxcount, uint32 incrtime, uint32 extendedCost, bool persist /*= true*/)
 {
     VendorItemData& vList = _cacheVendorItemStore[entry];
-    vList.AddItem(item, maxcount, incrtime, extendedCost);
+    vList.AddItem(item, maxcount, incrtime, extendedCost, VendorItemSourceKind::Runtime);
 
     if (persist)
     {
