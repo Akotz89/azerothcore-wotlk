@@ -20,6 +20,7 @@
 
 #include "DatabaseEnv.h"
 #include "Define.h"
+#include "StrictProgressionUpdates.h"
 #include <filesystem>
 #include <set>
 #include <string>
@@ -60,6 +61,9 @@ public:
 
     UpdateResult Update(bool const redundancyChecks, bool const allowRehash,
                         bool const archivedRedundancy, int32 const cleanDeadReferencesMaxCount) const;
+
+    UpdateResult UpdateProgression(std::vector<StrictProgression::File> const& manifest,
+        std::string const& nativeIdentity, bool auditedAdoption) const;
 
 private:
     enum UpdateMode

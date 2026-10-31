@@ -1460,7 +1460,7 @@ void WorldSession::InitWarden(SessionKey const& k, std::string const& os)
 
 Warden* WorldSession::GetWarden()
 {
-    return &(*_warden);
+    return _warden.get();
 }
 
 WorldSession::DosProtection::Policy WorldSession::DosProtection::EvaluateOpcode(WorldPacket const& p, time_t const time) const

@@ -76,6 +76,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include "LootReceipt.h"
 
 float baseMoveSpeed[MAX_MOVE_TYPE] =
 {
@@ -12132,6 +12133,11 @@ void Unit::UpdateDamageDoneMods(WeaponAttackType attackType, int32 /*skipEnchant
         if (!(aurEff->GetMiscValue() & SPELL_SCHOOL_MASK_NORMAL))
             return false;
 
+        if (Player* player = ToPlayer())
+            if (!sScriptMgr->OnPlayerCanApplyWeaponDependentAuraDamageMod(player,
+                    player->GetWeaponForAttack(attackType, true), attackType, aurEff, true))
+                return false;
+
         return CheckAttackFitToAuraRequirement(attackType, aurEff);
     });
 
@@ -12173,11 +12179,24 @@ void Unit::UpdateDamagePctDoneMods(WeaponAttackType attackType)
         if (!(aurEff->GetMiscValue() & SPELL_SCHOOL_MASK_NORMAL))
             return false;
 
+        if (Player* player = ToPlayer())
+            if (!sScriptMgr->OnPlayerCanApplyWeaponDependentAuraDamageMod(player,
+                    player->GetWeaponForAttack(attackType, true), attackType, aurEff, true))
+                return false;
+
         return CheckAttackFitToAuraRequirement(attackType, aurEff);
     });
 
     if (attackType == OFF_ATTACK)
-        factor *= GetTotalAuraMultiplier(SPELL_AURA_MOD_OFFHAND_DAMAGE_PCT, std::bind(&Unit::CheckAttackFitToAuraRequirement, this, attackType, std::placeholders::_1));
+        factor *= GetTotalAuraMultiplier(SPELL_AURA_MOD_OFFHAND_DAMAGE_PCT, [attackType, this](AuraEffect const* aurEff) -> bool
+        {
+            if (Player* player = ToPlayer())
+                if (!sScriptMgr->OnPlayerCanApplyWeaponDependentAuraDamageMod(player,
+                        player->GetWeaponForAttack(attackType, true), attackType, aurEff, true))
+                    return false;
+
+            return CheckAttackFitToAuraRequirement(attackType, aurEff);
+        });
 
     SetStatPctModifier(unitMod, TOTAL_PCT, factor);
 }
@@ -14073,12 +14092,21 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
         {
             Loot* loot = &creature->loot;
             loot->clear();
+            loot->receiptGeneration = LootReceipt::Next();
+            loot->receiptMapId = creature->GetMapId();
+            loot->receiptInstanceId = creature->GetInstanceId();
+            LootReceipt::Emit("loot_v1 generation_begin generation={} corpse={} map={} instance={}",
+                loot->receiptGeneration, creature->GetGUID().GetRawValue(), creature->GetMapId(), creature->GetInstanceId());
 
             if (uint32 lootid = creature->GetCreatureTemplate()->lootid)
                 loot->FillLoot(lootid, LootTemplates_Creature, looter, false, false, creature->GetLootMode(), creature);
 
             if (creature->GetLootMode())
                 loot->generateMoneyLoot(creature->GetCreatureTemplate()->mingold, creature->GetCreatureTemplate()->maxgold);
+
+            LootReceipt::Emit("loot_v1 generated generation={} corpse={} map={} instance={} gold={} items={} quest_items={}",
+                loot->receiptGeneration, creature->GetGUID().GetRawValue(), creature->GetMapId(),
+                creature->GetInstanceId(), loot->gold, loot->items.size(), loot->quest_items.size());
 
             if (group)
             {
@@ -16837,6 +16865,9 @@ void Unit::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
                 (index == UNIT_FIELD_AURASTATE && HasFlag(UNIT_FIELD_AURASTATE, PER_CASTER_AURA_STATE_MASK)))
         {
             updateMask.SetBit(index);
+            if (sScriptMgr->IsCustomBuildValuesUpdate(this, updateType, fieldBuffer, target, index))
+                continue;
+
 
             if (index == UNIT_NPC_FLAGS)
             {

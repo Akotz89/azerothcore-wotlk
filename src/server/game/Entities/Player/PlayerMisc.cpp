@@ -23,6 +23,10 @@
 #include "RBAC.h"
 #include "ScriptMgr.h"
 #include "WorldSession.h"
+#include "LootReceipt.h"
+#include "Transaction.h"
+#include <unordered_set>
+#include <algorithm>
 
 /*********************************************************/
 /***               FLOOD FILTER SYSTEM                 ***/
@@ -436,18 +440,60 @@ void Player::SendItemRetrievalMail(uint32 itemEntry, uint32 count)
 
 void Player::SendItemRetrievalMail(std::vector<std::pair<uint32, uint32>> mailItems)
 {
+    _SendItemRetrievalMail(std::move(mailItems), nullptr);
+}
+
+void Player::SendQuestRewardRetrievalMail(std::vector<std::pair<uint32, uint32>> mailItems,
+    std::vector<NativeQuestRewardObservation> observations)
+{
+    _SendItemRetrievalMail(std::move(mailItems), &observations);
+}
+
+void Player::_SendItemRetrievalMail(std::vector<std::pair<uint32, uint32>> mailItems,
+    std::vector<NativeQuestRewardObservation>* observations)
+{
+    // Optional observation state never owns Player/Item/session pointers and never controls earned mail.
+    auto loseObservation = [&]() noexcept
+    {
+        if (!observations) return;
+        for (auto& value : *observations)
+        {
+            value.deliveryPending = false; value.deliveryKnown = false; value.complete = false;
+            try { value.deliveryReason = "mail_observation_lost"; } catch (...) { }
+            sScriptMgr->OnPlayerQuestRewardDestinations(value);
+        }
+        observations = nullptr;
+    };
+    if (observations && observations->size() != mailItems.size()) loseObservation();
+    auto const link = LootReceipt::Disenchant::Claim(LootReceipt::Disenchant::Call::Retrieval, this, GetGUID().GetRawValue());
+    uint64 const receiptOp = link.parent ? LootReceipt::Next() : 0;
+    if (receiptOp)
+    {
+        LootReceipt::Emit("loot_v2 retrieval_begin op={} parent={} generation={} corpse={} actor={} requests={}",
+            receiptOp, link.parent, link.generation, link.corpse, link.actor, mailItems.size());
+        uint32 index = 0;
+        for (auto const& request : mailItems)
+            LootReceipt::Emit("loot_v2 retrieval_request op={} index={} entry={} count={}", receiptOp, index++, request.first, request.second);
+    }
     if (mailItems.empty())
     {
         // Skip send if empty items
         LOG_ERROR("entities.player.items", "> SendItemRetrievalMail: Attempt to send almost with items without items. Player {}", GetGUID().ToString());
+        if (receiptOp) LootReceipt::Emit("loot_v2 retrieval_end op={} reason=empty", receiptOp);
         return;
     }
 
     using SendMailTempateVector = std::vector<std::pair<uint32, uint32>>;
 
     std::vector<SendMailTempateVector> allItems;
+    std::vector<uint32> observationOrigins;
+    uint32 requestIndex = 0;
+    auto rememberOrigin = [&]() noexcept
+    {
+        if (observations) try { observationOrigins.push_back(requestIndex); } catch (...) { loseObservation(); }
+    };
 
-    auto AddMailItem = [&allItems](uint32 itemEntry, uint32 itemCount)
+    auto AddMailItem = [&allItems, receiptOp, &rememberOrigin](uint32 itemEntry, uint32 itemCount)
     {
         SendMailTempateVector toSendItems;
 
@@ -455,12 +501,14 @@ void Player::SendItemRetrievalMail(std::vector<std::pair<uint32, uint32>> mailIt
         if (!itemTemplate)
         {
             LOG_ERROR("entities.player.items", "> SendItemRetrievalMail: Item id {} is invalid", itemEntry);
+            if (receiptOp) LootReceipt::Emit("loot_v2 retrieval_rejected op={} entry={} count={}", receiptOp, itemEntry, itemCount);
             return;
         }
 
         if (itemCount < 1 || (itemTemplate->MaxCount > 0 && itemCount > static_cast<uint32>(itemTemplate->MaxCount)))
         {
             LOG_ERROR("entities.player.items", "> SendItemRetrievalMail: Incorrect item count ({}) for item id {}", itemEntry, itemCount);
+            if (receiptOp) LootReceipt::Emit("loot_v2 retrieval_rejected op={} entry={} count={}", receiptOp, itemEntry, itemCount);
             return;
         }
 
@@ -474,39 +522,130 @@ void Player::SendItemRetrievalMail(std::vector<std::pair<uint32, uint32>> mailIt
             else
             {
                 allItems.emplace_back(toSendItems);
+                rememberOrigin();
                 toSendItems.clear();
             }
         }
 
         toSendItems.emplace_back(itemEntry, itemCount);
         allItems.emplace_back(toSendItems);
+        rememberOrigin();
     };
 
     for (auto& [itemEntry, itemCount] : mailItems)
     {
         AddMailItem(itemEntry, itemCount);
+        ++requestIndex;
     }
 
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
 
+    uint32 receiptBatch = 0;
     for (auto const& items : allItems)
     {
         MailSender sender(MAIL_CREATURE, 34337 /* The Postmaster */);
         MailDraft draft("Recovered Item", "We recovered a lost item in the twisting nether and noted that it was yours.$B$BPlease find said object enclosed."); // This is the text used in Cataclysm, it probably wasn't changed.
 
+        uint32 receiptIndex = 0;
+        std::vector<NativeQuestRewardMailAttachment> savedAttachments;
         for (auto const& [itemEntry, itemCount] : items)
         {
+            if (receiptOp)
+                LootReceipt::Emit("loot_v2 retrieval_plan op={} batch={} index={} entry={} count={}",
+                    receiptOp, receiptBatch, receiptIndex, itemEntry, itemCount);
             if (Item* mailItem = Item::CreateItem(itemEntry, itemCount))
             {
+                uint64 const receiptGuid = mailItem->GetGUID().GetRawValue();
+                if (receiptOp)
+                    LootReceipt::Emit("loot_v2 retrieval_created op={} batch={} index={} guid={} entry={} count={} owner={} property={} suffix={}",
+                        receiptOp, receiptBatch, receiptIndex, receiptGuid, mailItem->GetEntry(), mailItem->GetCount(),
+                        mailItem->GetOwnerGUID().GetRawValue(), mailItem->GetItemRandomPropertyId(), mailItem->GetItemSuffixFactor());
                 mailItem->SaveToDB(trans);
+                if (observations)
+                {
+                    try { savedAttachments.push_back({receiptGuid, mailItem->GetEntry(), mailItem->GetCount(),
+                        mailItem->GetEntry(), mailItem->GetCount(), true}); }
+                    catch (...) { loseObservation(); }
+                }
+                if (receiptOp) LootReceipt::Emit("loot_v2 retrieval_save_queued op={} guid={}", receiptOp, receiptGuid);
                 draft.AddItem(mailItem);
             }
+            else if (receiptOp)
+                LootReceipt::Emit("loot_v2 retrieval_create_failed op={} batch={} index={} entry={} count={}",
+                    receiptOp, receiptBatch, receiptIndex, itemEntry, itemCount);
+            ++receiptIndex;
         }
 
-        draft.SendMailTo(trans, MailReceiver(this, GetGUID().GetCounter()), sender);
+        LootReceipt::Disenchant::Scope dispatch(LootReceipt::Disenchant::Call::Mail, &draft,
+            {receiptOp, link.generation, link.corpse, link.actor});
+        if (observations)
+        {
+            NativeQuestRewardMailEnvelope envelope;
+            draft.TrySendMailToObserved(trans, MailReceiver(this, GetGUID().GetCounter()), sender, envelope);
+            try
+            {
+                auto& value = (*observations)[observationOrigins.at(receiptBatch)];
+                for (auto& actual : envelope.attachments)
+                {
+                    auto saved = std::find_if(savedAttachments.begin(), savedAttachments.end(), [&](auto const& original)
+                        { return original.itemGuid == actual.itemGuid; });
+                    if (saved != savedAttachments.end())
+                    {
+                        actual.savedEntry = saved->itemEntry; actual.savedCount = saved->count;
+                        actual.savedValueMatched = actual.itemEntry == saved->itemEntry && actual.count == saved->count;
+                    }
+                }
+                value.mailEnvelopes.push_back(std::move(envelope));
+            }
+            catch (...) { loseObservation(); }
+        }
+        else draft.SendMailTo(trans, MailReceiver(this, GetGUID().GetCounter()), sender);
+    ++receiptBatch;
     }
 
-    CharacterDatabase.CommitTransaction(trans);
+    if (observations)
+    {
+        try
+        {
+            for (auto& value : *observations)
+            {
+                bool complete = !value.mailEnvelopes.empty();
+                std::unordered_set<uint64> seen;
+                value.countSum = 0;
+                for (auto const& envelope : value.mailEnvelopes)
+                {
+                    if (!envelope.queued || envelope.receiverGuid != uint32(value.actorGuid)) complete = false;
+                    for (auto const& attachment : envelope.attachments)
+                    {
+                        value.countSum += attachment.count;
+                        if (!seen.insert(attachment.itemGuid).second || !attachment.savedValueMatched || attachment.itemEntry != value.itemEntry)
+                            complete = false;
+                    }
+                }
+                value.queuedComplete = complete && value.countSum == value.count;
+                value.complete = false; value.deliveryPending = true;
+                value.deliveryReason = "mail_transaction_pending";
+            }
+        }
+        catch (...) { loseObservation(); }
+    }
+    if (observations)
+    {
+        for (auto const& value : *observations) sScriptMgr->OnPlayerQuestRewardDestinations(value);
+        try
+        {
+            auto callback = CharacterDatabase.AsyncCommitTransaction(trans);
+            sScriptMgr->TrackQuestRewardMailTransaction(std::move(callback), std::move(*observations));
+        }
+        catch (...)
+        {
+            // Current AsyncCommitTransaction cannot throw after Enqueue succeeds; restore the original submission on preparation failure.
+            loseObservation();
+            CharacterDatabase.CommitTransaction(trans);
+        }
+    }
+    else CharacterDatabase.CommitTransaction(trans);
+    if (receiptOp) LootReceipt::Emit("loot_v2 retrieval_end op={} reason=transaction_submitted batches={}", receiptOp, receiptBatch);
 }
 
 void Player::SendItemRetrievalMail(Item* item)

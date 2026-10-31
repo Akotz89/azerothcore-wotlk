@@ -16,6 +16,7 @@
  */
 
 #include "Mail.h"
+#include <set>
 #include "AuctionHouseMgr.h"
 #include "BattlegroundMgr.h"
 #include "CalendarMgr.h"
@@ -29,6 +30,7 @@
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "World.h"
+#include "LootReceipt.h"
 
 MailSender::MailSender(Object* sender, MailStationery stationery) : m_stationery(stationery)
 {
@@ -185,13 +187,60 @@ void MailDraft::SendReturnToSender(uint32 /*sender_acc*/, ObjectGuid::LowType se
 
 void MailDraft::SendMailTo(CharacterDatabaseTransaction trans, MailReceiver const& receiver, MailSender const& sender, MailCheckMask checked, uint32 deliver_delay, uint32 custom_expiration, bool deleteMailItemsFromDB, bool sendMail)
 {
+    (void)TrySendMailTo(trans, receiver, sender, checked, deliver_delay, custom_expiration, deleteMailItemsFromDB, sendMail);
+}
+
+bool MailDraft::TrySendMailTo(CharacterDatabaseTransaction trans, MailReceiver const& receiver, MailSender const& sender, MailCheckMask checked, uint32 deliver_delay, uint32 custom_expiration, bool deleteMailItemsFromDB, bool sendMail)
+{
+    return _TrySendMailTo(trans, receiver, sender, checked, deliver_delay, custom_expiration, deleteMailItemsFromDB, sendMail, nullptr);
+}
+
+bool MailDraft::TrySendMailToObserved(CharacterDatabaseTransaction trans, MailReceiver const& receiver, MailSender const& sender,
+    NativeQuestRewardMailEnvelope& observation)
+{
+    return _TrySendMailTo(trans, receiver, sender, MAIL_CHECK_MASK_NONE, 0, 0, false, true, &observation);
+}
+
+bool MailDraft::_TrySendMailTo(CharacterDatabaseTransaction trans, MailReceiver const& receiver, MailSender const& sender,
+    MailCheckMask checked, uint32 deliver_delay, uint32 custom_expiration, bool deleteMailItemsFromDB, bool sendMail,
+    NativeQuestRewardMailEnvelope* observation)
+{
+    auto const link = LootReceipt::Disenchant::Claim(LootReceipt::Disenchant::Call::Mail, this,
+        ObjectGuid::Create<HighGuid::Player>(receiver.GetPlayerGUIDLow()).GetRawValue());
+    uint64 const receiptOp = link.parent ? LootReceipt::Next() : 0;
+    auto receiptItems = [&](char const* phase) noexcept
+    {
+        if (!receiptOp) return;
+        LootReceipt::Emit("loot_v2 draft_items op={} phase={} count={}", receiptOp, phase, m_items.size());
+        uint32 index = 0;
+        for (auto const& attachment : m_items)
+        {
+            Item* item = attachment.second;
+            LootReceipt::Emit("loot_v2 draft_item op={} phase={} index={} map_guid={} guid={} entry={} count={} owner={} property={} suffix={}",
+                receiptOp, phase, index++, attachment.first.GetRawValue(), item ? item->GetGUID().GetRawValue() : 0,
+                item ? item->GetEntry() : 0, item ? item->GetCount() : 0, item ? item->GetOwnerGUID().GetRawValue() : 0,
+                item ? item->GetItemRandomPropertyId() : 0, item ? item->GetItemSuffixFactor() : 0);
+        }
+    };
+    if (receiptOp)
+        LootReceipt::Emit("loot_v2 draft_begin op={} parent={} generation={} corpse={} actor={} receiver={}",
+            receiptOp, link.parent, link.generation, link.corpse, link.actor, receiver.GetPlayerGUIDLow());
+    receiptItems("before_hook");
+    std::set<ObjectGuid> requestedItems;
+    for (auto const& item : m_items) requestedItems.insert(item.first);
     sScriptMgr->OnBeforeMailDraftSendMailTo(this, receiver, sender, checked, deliver_delay, custom_expiration, deleteMailItemsFromDB, sendMail);
 
+    if (receiptOp)
+        LootReceipt::Emit("loot_v2 draft_hook op={} delete_items={} send={}", receiptOp, deleteMailItemsFromDB, sendMail);
+    receiptItems("after_hook_before_delete");
     if (deleteMailItemsFromDB) // can be changed in the hook
         deleteIncludedItems(trans, true);
 
-    if (!sendMail) // can be changed in the hook
-        return;
+    if (!sendMail) // Ordinary native draft hooks may veto an already admitted send.
+    {
+        if (receiptOp) LootReceipt::Emit("loot_v2 draft_end op={} reason=cancelled remaining={}", receiptOp, m_items.size());
+        return false;
+    }
 
     Player* pReceiver = receiver.GetPlayer();               // can be nullptr
 
@@ -199,8 +248,16 @@ void MailDraft::SendMailTo(CharacterDatabaseTransaction trans, MailReceiver cons
         prepareItems(pReceiver, trans);                            // generate mail template items
 
     uint32 mailId = sObjectMgr->GenerateMailID();
+    if (receiptOp)
+        LootReceipt::Emit("loot_v2 draft_envelope op={} mail_id={} receiver={} attachments={}", receiptOp, mailId, receiver.GetPlayerGUIDLow(), m_items.size());
+    receiptItems("prepared");
 
     time_t deliver_time = GameTime::GetGameTime().count() + deliver_delay;
+    if (observation)
+    {
+        observation->mailId = mailId; observation->receiverGuid = receiver.GetPlayerGUIDLow();
+        observation->deliverTime = deliver_time;
+    }
 
     //expire time if COD 3 days, if no COD 30 days, if auction sale pending 1 hour
     uint32 expire_delay;
@@ -243,6 +300,13 @@ void MailDraft::SendMailTo(CharacterDatabaseTransaction trans, MailReceiver cons
     stmt->SetData(++index, uint8(checked));
     trans->Append(stmt);
 
+    bool requestedAttachmentsQueued = true;
+    for (ObjectGuid guid : requestedItems)
+    {
+        auto found = m_items.find(guid);
+        if (found == m_items.end() || !found->second || found->second->GetGUID() != guid)
+            requestedAttachmentsQueued = false;
+    }
     for (MailItemMap::const_iterator mailItemIter = m_items.begin(); mailItemIter != m_items.end(); ++mailItemIter)
     {
         stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_MAIL_ITEM);
@@ -250,6 +314,15 @@ void MailDraft::SendMailTo(CharacterDatabaseTransaction trans, MailReceiver cons
         stmt->SetData(1, mailItemIter->second->GetGUID().GetCounter());
         stmt->SetData(2, receiver.GetPlayerGUIDLow());
         trans->Append(stmt);
+        if (observation)
+        {
+            try { observation->attachments.push_back({mailItemIter->second->GetGUID().GetRawValue(),
+                mailItemIter->second->GetEntry(), mailItemIter->second->GetCount(), 0, 0, false}); }
+            catch (...) { observation->queued = false; observation = nullptr; }
+        }
+        if (receiptOp)
+            LootReceipt::Emit("loot_v2 draft_attachment_queued op={} mail_id={} guid={} receiver={}",
+                receiptOp, mailId, mailItemIter->second->GetGUID().GetRawValue(), receiver.GetPlayerGUIDLow());
     }
 
     sMailMgr->OnMailSent(receiver.GetPlayerGUIDLow());
@@ -296,4 +369,9 @@ void MailDraft::SendMailTo(CharacterDatabaseTransaction trans, MailReceiver cons
     {
         deleteIncludedItems(CharacterDatabaseTransaction(nullptr));
     }
+    if (receiptOp)
+        LootReceipt::Emit("loot_v2 draft_end op={} reason=rows_queued_not_durable mail_id={} requested_attachments_queued={}",
+            receiptOp, mailId, requestedAttachmentsQueued);
+    if (observation) observation->queued = requestedAttachmentsQueued;
+    return requestedAttachmentsQueued;
 }

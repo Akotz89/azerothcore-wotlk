@@ -430,6 +430,39 @@ bool DBUpdater<T>::Update(DatabaseWorkerPool<T>& pool, std::vector<std::string> 
     return true;
 }
 
+
+template<class T>
+bool DBUpdater<T>::UpdateProgression(DatabaseWorkerPool<T>& pool, std::vector<std::string> const& directories,
+    std::vector<StrictProgression::File> const& manifest, std::string const& nativeIdentity, bool auditedAdoption)
+{
+    auto const failedBefore = DBUpdaterUtil::GetFailedUpdateCount();
+    try
+    {
+        if (!DBUpdaterUtil::CheckExecutable() || !is_directory(Path(GetSourceDirectory())))
+            throw UpdateException("Progression updater executable/source unavailable");
+        UpdateFetcher fetcher(Path(GetSourceDirectory()),
+            [&](std::string const& query) { Apply(pool, query); },
+            [&](Path const& file)
+            {
+                auto failures = DBUpdaterUtil::GetFailedUpdateCount();
+                ApplyFile(pool, file);
+                // Dry run retains the fork's failed-file counter, but strict
+                // progression must never record an unsuccessful file as applied.
+                if (DBUpdaterUtil::GetFailedUpdateCount() != failures)
+                    throw UpdateException("Progression SQL import failed, including dry run");
+            },
+            [&](std::string const& query) { return Retrieve(pool, query); }, GetDBModuleName(), &directories);
+        fetcher.UpdateProgression(manifest, nativeIdentity, auditedAdoption);
+        return true;
+    }
+    catch (std::exception const& error)
+    {
+        if (DBUpdaterUtil::GetFailedUpdateCount() == failedBefore) DBUpdaterUtil::MarkUpdateFailed();
+        LOG_ERROR("sql.updates", "Strict progression startup failed: {}", error.what());
+        return false;
+    }
+}
+
 template<class T>
 bool DBUpdater<T>::Populate(DatabaseWorkerPool<T>& pool)
 {
@@ -544,6 +577,8 @@ void DBUpdater<T>::ApplyFile(DatabaseWorkerPool<T>& pool, std::string const& hos
     args.reserve(9);
 
     args.emplace_back("--defaults-extra-file="+tempDir + confFileName+"");
+    // SQL failure must abort the batch even if an inherited client file enables force.
+    args.emplace_back("--skip-force");
 
     // CLI Client connection info
     args.emplace_back("-h" + host);

@@ -210,6 +210,12 @@ void WorldSession::HandleAuctionSellItem(WorldPacket& recvData)
             return;
         }
 
+        if (!sScriptMgr->OnPlayerCanCreateProgressionAuction(_player, item))
+        {
+            SendAuctionCommandResult(0, AUCTION_SELL_ITEM, ERR_AUCTION_DATABASE_ERROR);
+            return;
+        }
+
         if (itemEntry == 0)
             itemEntry = item->GetTemplate()->ItemId;
 

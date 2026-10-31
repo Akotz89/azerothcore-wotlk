@@ -43,6 +43,7 @@ public:
 
     Map* FindBaseMap(uint32 mapId) const // pussywizard: need this public for movemaps (mmaps)
     {
+        std::lock_guard<std::mutex> guard(Lock);
         MapMapType::const_iterator iter = i_maps.find(mapId);
         return (iter == i_maps.end() ? nullptr : iter->second);
     }
@@ -168,7 +169,9 @@ private:
     MapMgr(MapMgr const&);
     MapMgr& operator=(MapMgr const&);
 
-    std::mutex Lock;
+    std::vector<Map*> GetBaseMaps() const;
+
+    mutable std::mutex Lock;
     MapMapType i_maps;
     IntervalTimer i_timer[4]; // continents, bgs/arenas, instances, total from the beginning
     uint8 mapUpdateStep;
@@ -181,16 +184,17 @@ private:
 template<typename Worker>
 void MapMgr::DoForAllMaps(Worker&& worker)
 {
-    std::lock_guard<std::mutex> guard(Lock);
-
-    for (auto& mapPair : i_maps)
+    for (Map* map : GetBaseMaps())
     {
-        Map* map = mapPair.second;
         if (MapInstanced* mapInstanced = map->ToMapInstanced())
         {
             MapInstanced::InstancedMaps& instances = mapInstanced->GetInstancedMaps();
-            for (auto& instancePair : instances)
-                worker(instancePair.second);
+            std::vector<Map*> snapshot;
+            snapshot.reserve(instances.size());
+            for (auto const& instancePair : instances)
+                snapshot.push_back(instancePair.second);
+            for (Map* instance : snapshot)
+                worker(instance);
         }
         else
             worker(map);
@@ -200,17 +204,17 @@ void MapMgr::DoForAllMaps(Worker&& worker)
 template<typename Worker>
 inline void MapMgr::DoForAllMapsWithMapId(uint32 mapId, Worker&& worker)
 {
-    std::lock_guard<std::mutex> guard(Lock);
-
-    auto itr = i_maps.find(mapId);
-    if (itr != i_maps.end())
+    if (Map* map = FindBaseMap(mapId))
     {
-        Map* map = itr->second;
         if (MapInstanced* mapInstanced = map->ToMapInstanced())
         {
             MapInstanced::InstancedMaps& instances = mapInstanced->GetInstancedMaps();
-            for (auto& p : instances)
-                worker(p.second);
+            std::vector<Map*> snapshot;
+            snapshot.reserve(instances.size());
+            for (auto const& instancePair : instances)
+                snapshot.push_back(instancePair.second);
+            for (Map* instance : snapshot)
+                worker(instance);
         }
         else
             worker(map);

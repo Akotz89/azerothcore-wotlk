@@ -137,7 +137,8 @@ int ns1__executeCommand(soap* soap, char* command, char** result)
         return SOAP_OK;
     }
     else
-        return soap_sender_fault(soap, printBuffer, printBuffer);
+        // The fault string escapes text; detail expects raw XML, not command output.
+        return soap_sender_fault(soap, printBuffer, nullptr);
 }
 
 void SOAPCommand::commandFinished(void* soapconnection, bool success)

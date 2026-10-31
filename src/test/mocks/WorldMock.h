@@ -77,7 +77,7 @@ public:
     MOCK_METHOD(void, LoadDBVersion, ());
     MOCK_METHOD(char const *, GetDBVersion, (), (const));
 #ifdef MOD_PLAYERBOTS
-    MOCK_METHOD(char const*, GetPlayerbotsDBRevision, (), (const));
+    MOCK_METHOD(char const*, GetPlayerbotsDBRevision, (), (const, override));
 #endif
     MOCK_METHOD(void, UpdateAreaDependentAuras, ());
     MOCK_METHOD(uint32, GetCleaningFlags, (), (const));
@@ -87,9 +87,15 @@ public:
     MOCK_METHOD(time_t, GetNextTimeWithMonthAndHour, (int8 month, int8 hour), ());
     MOCK_METHOD(std::string const&, GetRealmName, (), (const));
     MOCK_METHOD(void, SetRealmName, (std::string name), ());
-    MOCK_METHOD(SQLQueryHolderCallback&, AddQueryHolderCallback, (SQLQueryHolderCallback&& callback), ());
+    SQLQueryHolderCallback& AddQueryHolderCallback(SQLQueryHolderCallback&& callback) override
+    {
+        return _queryHolderProcessor.AddCallback(std::move(callback));
+    }
     MOCK_METHOD(void, RemoveOldCorpses, ());
     MOCK_METHOD(void, ReloadRBAC, ());
+
+private:
+    AsyncCallbackProcessor<SQLQueryHolderCallback> _queryHolderProcessor;
 };
 #pragma GCC diagnostic pop
 

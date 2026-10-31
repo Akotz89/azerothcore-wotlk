@@ -68,16 +68,16 @@ public:
 
     bool PrepareStatements();
 
-    bool Execute(std::string_view sql);
-    bool Execute(PreparedStatementBase* stmt);
+    bool Execute(std::string_view sql, bool allowReconnect = true);
+    bool Execute(PreparedStatementBase* stmt, bool allowReconnect = true);
     ResultSet* Query(std::string_view sql);
     PreparedResultSet* Query(PreparedStatementBase* stmt);
     bool _Query(std::string_view sql, MySQLResult** pResult, MySQLField** pFields, uint64* pRowCount, uint32* pFieldCount);
     bool _Query(PreparedStatementBase* stmt, MySQLPreparedStatement** mysqlStmt, MySQLResult** pResult, uint64* pRowCount, uint32* pFieldCount);
 
-    void BeginTransaction();
+    bool BeginTransaction();
     void RollbackTransaction();
-    void CommitTransaction();
+    bool CommitTransaction();
     int ExecuteTransaction(std::shared_ptr<TransactionBase> transaction);
     std::size_t EscapeString(char* to, char const* from, std::size_t length);
     void Ping();
