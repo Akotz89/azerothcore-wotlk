@@ -26,6 +26,9 @@ protected:
     AllGameObjectScript(char const* name);
 
 public:
+    // Global handled-result seam preserves the database-bound fallback when false.
+    [[nodiscard]] virtual bool OnGameObjectQuestReward(Player* /*player*/, GameObject* /*go*/, Quest const* /*quest*/, uint32 /*opt*/) { return false; }
+
     /**
      * @brief This hook runs after add game object in world
      *

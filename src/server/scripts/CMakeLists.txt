@@ -155,7 +155,7 @@ foreach(SCRIPT_MODULE ${SCRIPT_MODULE_LIST})
     # Uninstall disabled modules
     GetProjectNameOfScriptModule(${SCRIPT_MODULE} SCRIPT_MODULE_PROJECT_NAME)
     GetNativeSharedLibraryName(${SCRIPT_MODULE_PROJECT_NAME} SCRIPT_MODULE_OUTPUT_NAME)
-    list(APPEND DISABLED_SCRIPT_MODULE_PROJECTS ${INSTALL_OFFSET}/${SCRIPT_MODULE_OUTPUT_NAME})
+    list(APPEND DISABLED_SCRIPT_MODULE_PROJECTS "${INSTALL_OFFSET}/${SCRIPT_MODULE_OUTPUT_NAME}")
     if(${SCRIPT_MODULE_VARIABLE} STREQUAL "static")
       # Add the module name to STATIC_SCRIPT_MODULES
       list(APPEND STATIC_SCRIPT_MODULES ${SCRIPT_MODULE})
@@ -255,7 +255,8 @@ endif()
 # are contained in the static library already.
 if(DISABLED_SCRIPT_MODULE_PROJECTS)
   install(CODE "
-    foreach(SCRIPT_TO_UNINSTALL ${DISABLED_SCRIPT_MODULE_PROJECTS})
+    set(_scripts_to_uninstall \"${DISABLED_SCRIPT_MODULE_PROJECTS}\")
+    foreach(SCRIPT_TO_UNINSTALL IN LISTS _scripts_to_uninstall)
       if(EXISTS \"\${SCRIPT_TO_UNINSTALL}\")
         message(STATUS \"Uninstalling: \${SCRIPT_TO_UNINSTALL}\")
         file(REMOVE \"\${SCRIPT_TO_UNINSTALL}\")

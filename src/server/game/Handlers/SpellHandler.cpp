@@ -19,6 +19,7 @@
 #include "GameObjectAI.h"
 #include "Log.h"
 #include "ObjectMgr.h"
+#include "ObjectAccessor.h"
 #include "Opcodes.h"
 #include "Player.h"
 #include "ScriptMgr.h"
@@ -106,6 +107,7 @@ void WorldSession::HandleUseItemOpcode(WorldPacket& recvPacket)
         }
     }
 
+    if (!IsNativeMutationAuthorized()) return;
     // try queue spell if it can't be executed right now
     if (!_player->CanExecutePendingSpellCastRequest(spellInfo))
         if (_player->CanRequestSpellCast(spellInfo))
@@ -143,7 +145,19 @@ void WorldSession::HandleUseItemOpcode(WorldPacket& recvPacket)
         return;
     }
 
+    ObjectGuid const userGuid = pUser->GetGUID();
+    auto refreshItem = [&]()
+    {
+        if (_player != pUser || ObjectAccessor::FindPlayer(userGuid) != pUser || pUser->GetSession() != this ||
+            isLogingOut() || !pUser->IsInWorld() || !IsNativeMutationAuthorized()) return false;
+        Item* current = pUser->GetUseableItemByPos(bagIndex, slot);
+        if (!current || current->GetGUID() != itemGUID || current->GetOwnerGUID() != userGuid || current->IsInTrade())
+            return false;
+        pItem = current;
+        return true;
+    };
     InventoryResult msg = pUser->CanUseItem(pItem);
+    if (!refreshItem()) return;
     if (msg != EQUIP_ERR_OK)
     {
         pUser->SendEquipError(msg, pItem, nullptr);
@@ -196,6 +210,9 @@ void WorldSession::HandleUseItemOpcode(WorldPacket& recvPacket)
     // Note: If script stop casting it must send appropriate data to client to prevent stuck item in gray state.
     if (!sScriptMgr->OnItemUse(pUser, pItem, targets))
     {
+        // Hooks may remove either the used item or an explicit target.
+        if (!refreshItem()) return;
+        targets.Update(pUser);
         // no script or script not process request by self
         pUser->CastItemUseSpell(pItem, targets, castCount, glyphIndex);
     }

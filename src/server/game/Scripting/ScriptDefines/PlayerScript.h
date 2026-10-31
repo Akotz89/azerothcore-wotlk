@@ -27,6 +27,37 @@
 #include "AchievementMgr.h"
 #include "KillRewarder.h"
 
+// Copied ordinary quest storage witnesses; no Item/Quest/Player pointer crosses the hook.
+struct NativeQuestRewardDestination
+{
+    uint16 bagSlot{0};
+    uint32 plannedCount{0}, beforeEntry{0}, itemEntry{0}, beforeCount{0}, afterCount{0}, delta{0};
+    uint64 beforeGuid{0}, itemGuid{0};
+    bool matched{false};
+};
+struct NativeQuestRewardMailAttachment
+{
+    uint64 itemGuid{0};
+    uint32 itemEntry{0}, count{0}, savedEntry{0}, savedCount{0};
+    bool savedValueMatched{false};
+};
+struct NativeQuestRewardMailEnvelope
+{
+    uint32 mailId{0}, receiverGuid{0};
+    uint64 deliverTime{0};
+    bool queued{false};
+    std::vector<NativeQuestRewardMailAttachment> attachments;
+};
+struct NativeQuestRewardObservation
+{
+    uint64 actorGuid{0}, sessionIncarnation{0}, countSum{0}, operationId{0};
+    uint32 accountId{0}, questId{0}, rewardIndex{0}, itemEntry{0}, count{0};
+    std::string rewardKind, deliveryReason;
+    bool complete{false}, deliveryPending{false}, deliveryKnown{false}, transactionCommitted{false}, queuedComplete{false};
+    std::vector<NativeQuestRewardDestination> destinations;
+    std::vector<NativeQuestRewardMailEnvelope> mailEnvelopes;
+};
+
 enum PlayerHook
 {
     PLAYERHOOK_ON_PLAYER_JUST_DIED,
@@ -52,9 +83,12 @@ enum PlayerHook
     PLAYERHOOK_ON_BEFORE_LOOT_MONEY,
     PLAYERHOOK_ON_BEFORE_SEND_LOOT,
     PLAYERHOOK_ON_GIVE_EXP,
+    PLAYERHOOK_GET_PROGRESSION_LEVEL_CEILING,
+    PLAYERHOOK_CAN_PROGRESS,
     PLAYERHOOK_ON_REPUTATION_CHANGE,
     PLAYERHOOK_ON_REPUTATION_RANK_CHANGE,
     PLAYERHOOK_ON_LEARN_SPELL,
+    PLAYERHOOK_CAN_LEARN_PROGRESSION_SPELL,
     PLAYERHOOK_ON_FORGOT_SPELL,
     PLAYERHOOK_ON_DUEL_REQUEST,
     PLAYERHOOK_ON_DUEL_START,
@@ -107,9 +141,11 @@ enum PlayerHook
     PLAYERHOOK_ON_LOOT_ITEM,
     PLAYERHOOK_ON_BEFORE_FILL_QUEST_LOOT_ITEM,
     PLAYERHOOK_ON_STORE_NEW_ITEM,
+    PLAYERHOOK_CAN_STORE_PROGRESSION_ITEM,
     PLAYERHOOK_ON_CREATE_ITEM,
     PLAYERHOOK_ON_QUEST_REWARD_ITEM,
     PLAYERHOOK_CAN_PLACE_AUCTION_BID,
+    PLAYERHOOK_CAN_CREATE_PROGRESSION_AUCTION,
     PLAYERHOOK_ON_GROUP_ROLL_REWARD_ITEM,
     PLAYERHOOK_ON_BEFORE_OPEN_ITEM,
     PLAYERHOOK_ON_BEFORE_QUEST_COMPLETE,
@@ -199,6 +235,9 @@ enum PlayerHook
     PLAYERHOOK_ON_PLAYER_LEAVE_COMBAT,
     PLAYERHOOK_ON_QUEST_ABANDON,
     PLAYERHOOK_ON_PLAYER_QUEST_ACCEPT,
+    PLAYERHOOK_CAN_ACCEPT_QUEST,
+    PLAYERHOOK_CAN_PROGRESS_QUEST_OBJECTIVE,
+    PLAYERHOOK_CAN_REWARD_QUEST,
     PLAYERHOOK_ON_GET_QUEST_RATE,
     PLAYERHOOK_ON_CAN_PLAYER_FLY_IN_ZONE,
     PLAYERHOOK_ANTICHEAT_SET_CAN_FLY_BY_SERVER,
@@ -212,6 +251,8 @@ enum PlayerHook
     PLAYERHOOK_ON_AFTER_CREATURE_LOOT,
     PLAYERHOOK_ON_AFTER_CREATURE_LOOT_MONEY,
     PLAYERHOOK_ON_CAN_UPDATE_SKILL,
+    PLAYERHOOK_GET_PROGRESSION_SKILL_CEILING,
+    PLAYERHOOK_CAN_SET_PROGRESSION_SKILL,
     PLAYERHOOK_ON_BEFORE_UPDATE_SKILL,
     PLAYERHOOK_ON_UPDATE_SKILL,
     PLAYERHOOK_ON_SET_SKILL,
@@ -222,6 +263,7 @@ enum PlayerHook
     PLAYERHOOK_ON_GET_REPUTATION_PRICE_DISCOUNT,
     PLAYERHOOK_ON_LEARN_TAXI_NODE,
     PLAYERHOOK_ON_BEFORE_GET_LEVEL_FOR_XP_GAIN,
+    PLAYERHOOK_ON_QUEST_REWARD_DESTINATIONS,
     PLAYERHOOK_END
 };
 
@@ -296,6 +338,12 @@ public:
     // Called when a player gains XP (before anything is given)
     virtual void OnPlayerGiveXP(Player* /*player*/, uint32& /*amount*/, Unit* /*victim*/, uint8 /*xpSource*/) { }
 
+    // Called before any XP path applies its level ceiling. Scripts may only lower the value.
+    virtual void OnPlayerGetProgressionLevelCeiling(Player* /*player*/, uint8& /*ceiling*/) { }
+
+    // Called before a persistent progression mutation. False is a hard hold.
+    [[nodiscard]] virtual bool OnPlayerCanProgress(Player* /*player*/) { return true; }
+
     // Called when a player's reputation changes (before it is actually changed)
     virtual bool OnPlayerReputationChange(Player* /*player*/, uint32 /*factionID*/, int32& /*standing*/, bool /*incremental*/) { return true; }
 
@@ -307,6 +355,8 @@ public:
 
     // Called when a player learned new spell
     virtual void OnPlayerLearnSpell(Player* /*player*/, uint32 /*spellID*/) {}
+
+    [[nodiscard]] virtual bool OnPlayerCanLearnProgressionSpell(Player* /*player*/, uint32 /*spellID*/) { return true; }
 
     // Called when a player forgot spell
     virtual void OnPlayerForgotSpell(Player* /*player*/, uint32 /*spellID*/) {}
@@ -443,14 +493,23 @@ public:
     //After looting item (includes master loot).
     virtual void OnPlayerStoreNewItem(Player* /*player*/, Item* /*item*/, uint32 /*count*/) { }
 
+    // New-item acquisition boundary shared by loot, quest, vendor, mail, trade and scripts.
+    [[nodiscard]] virtual bool OnPlayerCanStoreProgressionItem(Player* /*player*/, ItemTemplate const* /*item*/) { return true; }
+
     //After creating item (eg profession item creation)
     virtual void OnPlayerCreateItem(Player* /*player*/, Item* /*item*/, uint32 /*count*/) { }
 
     // After receiving item as a quest reward
     virtual void OnPlayerQuestRewardItem(Player* /*player*/, Item* /*item*/, uint32 /*count*/) { }
+    // Passive opt-in for the existing value-observation listener, before any destination/mail preparation.
+    virtual bool ShouldObserveQuestReward(uint64 /*actorGuid*/, uint32 /*accountId*/, uint64 /*session*/, uint32 /*questId*/) { return false; }
+    virtual void OnPlayerQuestRewardDestinations(NativeQuestRewardObservation const& /*observation*/) { }
 
     // When placing a bid or buying out an auction
     [[nodiscard]] virtual bool OnPlayerCanPlaceAuctionBid(Player* /*player*/, AuctionEntry* /*auction*/) { return true; }
+
+    // Auction posting has no AuctionEntry yet, so it needs an item-side predicate.
+    [[nodiscard]] virtual bool OnPlayerCanCreateProgressionAuction(Player* /*player*/, Item* /*item*/) { return true; }
 
     // After receiving item as a group roll reward
     virtual void OnPlayerGroupRollRewardItem(Player* /*player*/, Item* /*item*/, uint32 /*count*/, RollVote /*voteType*/, Roll* /*roll*/) { }
@@ -756,6 +815,11 @@ public:
      */
     virtual void OnPlayerQuestAccept(Player* /*player*/, Quest const* /*quest*/) { }
 
+    // Return-bearing gates used by both client handlers and server-side/bot quest paths.
+    [[nodiscard]] virtual bool OnPlayerCanAcceptQuest(Player* /*player*/, Quest const* /*quest*/) { return true; }
+    [[nodiscard]] virtual bool OnPlayerCanProgressQuestObjective(Player* /*player*/, Quest const* /*quest*/) { return true; }
+    [[nodiscard]] virtual bool OnPlayerCanRewardQuest(Player* /*player*/, Quest const* /*quest*/) { return true; }
+
     /**
      * @brief This hook called before other CanFlyChecks are applied
      *
@@ -800,6 +864,8 @@ public:
     virtual void OnPlayerAfterCreatureLootMoney(Player* /*player*/) { }
 
     virtual bool OnPlayerCanUpdateSkill(Player* /*player*/, uint32 /*skillId*/) { return true; }
+    virtual void OnPlayerGetProgressionSkillCeiling(Player* /*player*/, uint32 /*skillId*/, uint32& /*ceiling*/) { }
+    [[nodiscard]] virtual bool OnPlayerCanSetProgressionSkill(Player* /*player*/, uint32 /*skillId*/, uint32 /*value*/, uint32 /*max*/, uint32 /*step*/) { return true; }
     virtual void OnPlayerBeforeUpdateSkill(Player* /*player*/, uint32 /*skillId*/, uint32& /*value*/, uint32 /*max*/, uint32 /*step*/) { }
     virtual void OnPlayerUpdateSkill(Player* /*player*/, uint32 /*skillId*/, uint32 /*value*/, uint32 /*max*/, uint32 /*step*/, uint32 /*newValue*/) { }
     virtual void OnPlayerSetSkill(Player* /*player*/, uint32 /*skillId*/, uint32 /*value*/, uint32 /*max*/, uint32 /*step*/, uint32 /*newValue*/) { }

@@ -41,6 +41,7 @@
 #include "TradeData.h"
 #include "Unit.h"
 #include "WorldSession.h"
+#include <functional>
 #include <set>
 #include <string>
 #include <vector>
@@ -642,6 +643,7 @@ typedef std::unordered_map<uint32, SkillStatusData> SkillStatusMap;
 
 class Quest;
 class Spell;
+struct NativeQuestRewardObservation;
 class Item;
 class WorldSession;
 
@@ -1259,6 +1261,7 @@ public:
     void SetVirtualItemSlot(uint8 i, Item* item);
     void SetSheath(SheathState sheathed) override;             // overwrite Unit version
     uint8 FindEquipSlot(ItemTemplate const* proto, uint32 slot, bool swap) const;
+    uint8 FindEquipSlotBase(ItemTemplate const* proto, uint32 slot, bool swap) const;
     uint32 GetItemCount(uint32 item, bool inBankAlso = false, Item* skipItem = nullptr) const;
     uint32 GetItemCountWithLimitCategory(uint32 limitCategory, Item* skipItem = nullptr) const;
     [[nodiscard]] Item* GetItemByGuid(ObjectGuid guid) const;
@@ -1327,6 +1330,7 @@ public:
     bool IsTotemCategoryCompatiableWith(ItemTemplate const* pProto, uint32 requiredTotemCategoryId) const;
     InventoryResult BotCanUseItem(ItemTemplate const* pItem) const;
     InventoryResult CanUseItem(ItemTemplate const* pItem) const;
+    InventoryResult CanUseItemRequirements(ItemTemplate const* proto) const;
     [[nodiscard]] InventoryResult CanUseAmmo(uint32 item) const;
     InventoryResult CanRollForItemInLFG(ItemTemplate const* item, WorldObject const* lootedObject) const;
     Item* StoreNewItem(ItemPosCountVec const& pos, uint32 item, bool update, int32 randomPropertyId = 0, bool refund = false);
@@ -1391,7 +1395,39 @@ public:
         return mainItem && mainItem->GetTemplate()->InventoryType == INVTYPE_2HWEAPON && !CanTitanGrip();
     }
     void SendNewItem(Item* item, uint32 count, bool received, bool created, bool broadcast = false, bool sendChatMessage = true);
-    bool BuyItemFromVendorSlot(ObjectGuid vendorguid, uint32 vendorslot, uint32 item, uint8 count, uint8 bag, uint8 slot);
+    struct GuardedVendorResult
+    {
+        std::string status{"refused_before_effect"}, reason{"native_validation"}, stage{"validation"};
+        uint32 moneyBefore{0}, moneyAfter{0}, itemBefore{0}, itemAfter{0}, price{0};
+        uint32 observedMoneyAfter{0}, observedItemAfter{0};
+        bool observationValid{false};
+        ObjectGuid itemGuid;
+    };
+    struct GuardedVendorRequest
+    {
+        ObjectGuid vendorGuid;
+        uint32 vendorEntry{0}, vendorSlot{0}, item{0}, price{0}, stock{0}, money{0}, maxCount{0}, incrTime{0};
+        uintptr_t vendorListToken{0}, itemTemplateToken{0};
+        uint16 destination{0};
+        std::string inventoryWitness;
+        // locate checks lifetime; current also checks admission/goal/source/equipment witnesses.
+        std::function<Player*()> locate;
+        std::function<bool()> current;
+    };
+    // Scoped only to the post-commit notification chain; exported mutator signatures stay unchanged.
+    struct GuardedVendorNotification
+    {
+        Player* actor;
+        GuardedVendorNotification* previous;
+        std::function<Player*()> locate;
+        ObjectGuid itemGuid, actorGuid;
+        uint32 itemEntry;
+        std::set<uint32> rewardingQuests;
+        GuardedVendorNotification(Player*, std::function<Player*()> const&, ObjectGuid, uint32);
+        ~GuardedVendorNotification();
+    };
+    static GuardedVendorResult BuyItemFromVendorGuarded(GuardedVendorRequest const& request);
+    bool BuyItemFromVendorSlot(ObjectGuid vendorguid, uint32 vendorslot, uint32 item, uint8 count, uint8 bag, uint8 slot, GuardedVendorRequest const* guarded = nullptr, GuardedVendorResult* receipt = nullptr);
     bool _StoreOrEquipNewItem(uint32 vendorslot, uint32 item, uint8 count, uint8 bag, uint8 slot, int32 price, ItemTemplate const* pProto, Creature* pVendor, VendorItem const* crItem, bool bStore);
 
     [[nodiscard]] float GetReputationPriceDiscount(Creature const* creature) const;
@@ -1678,7 +1714,11 @@ public:
 
     [[nodiscard]] PlayerMails const& GetMails() const { return m_mail; }
     void SendItemRetrievalMail(uint32 itemEntry, uint32 count); // Item retrieval mails sent by The Postmaster (34337)
-    void SendItemRetrievalMail(std::vector<std::pair<uint32, uint32>> mailItems); // Item retrieval mails sent by The Postmaster (34337)
+    void SendItemRetrievalMail(std::vector<std::pair<uint32, uint32>> mailItems);
+    void SendQuestRewardRetrievalMail(std::vector<std::pair<uint32, uint32>> mailItems,
+        std::vector<NativeQuestRewardObservation> observations);
+    void _SendItemRetrievalMail(std::vector<std::pair<uint32, uint32>> mailItems,
+        std::vector<NativeQuestRewardObservation>* observations); // Item retrieval mails sent by The Postmaster (34337)
     void SendItemRetrievalMail(Item* item); // As above, but for a pre-created item (preserves randomPropertyId)
 
     /*********************************************************/
@@ -2099,7 +2139,7 @@ public:
 
     void JoinedChannel(Channel* c);
     void LeftChannel(Channel* c);
-    bool IsInChannel(Channel const* c);
+    bool IsInChannel(const Channel* c);
     void CleanupChannels();
     void ClearChannelWatch();
     void UpdateLFGChannel();
@@ -2243,7 +2283,7 @@ public:
     void ResetAllPowers();
 
     void CastAllObtainSpells();
-    void ApplyItemObtainSpells(Item* item, bool apply);
+    void ApplyItemObtainSpells(Item* item, bool apply, std::function<Player*()> const* lifetime = nullptr);
     void UpdateItemObtainSpells(Item* item, uint8 bag, uint8 slot);
 
     SpellSchoolMask GetMeleeDamageSchoolMask(WeaponAttackType attackType = BASE_ATTACK, uint8 damageIndex = 0) const override;
@@ -2603,6 +2643,7 @@ public:
     [[nodiscard]] bool CanSeeTrainer(Creature const* creature) const;
 
 private:
+    uint8 FindEquipSlotImpl(ItemTemplate const* proto, uint32 slot, bool swap, bool baseClassOnly) const;
     [[nodiscard]] bool AnyVendorOptionAvailable(uint32 menuId, Creature const* creature) const;
 public:
     [[nodiscard]] uint32 GetChampioningFaction() const { return m_ChampioningFaction; }
@@ -2999,7 +3040,18 @@ private:
     InventoryResult CanStoreItem_InSpecificSlot(uint8 bag, uint8 slot, ItemPosCountVec& dest, ItemTemplate const* pProto, uint32& count, bool swap, Item* pSrcItem) const;
     InventoryResult CanStoreItem_InBag(uint8 bag, ItemPosCountVec& dest, ItemTemplate const* pProto, uint32& count, bool merge, bool non_specialized, Item* pSrcItem, uint8 skip_bag, uint8 skip_slot) const;
     InventoryResult CanStoreItem_InInventorySlots(uint8 slot_begin, uint8 slot_end, ItemPosCountVec& dest, ItemTemplate const* pProto, uint32& count, bool merge, Item* pSrcItem, uint8 skip_bag, uint8 skip_slot) const;
-    Item* _StoreItem(uint16 pos, Item* pItem, uint32 count, bool clone, bool update);
+    Item* _StoreItem(uint16 pos, Item* pItem, uint32 count, bool clone, bool update, GuardedVendorResult* receipt = nullptr);
+    GuardedVendorNotification* _guardedVendorNotification{nullptr};
+    void _ItemAddedQuestCheckGuarded(uint32 entry, uint32 count, GuardedVendorNotification const* notification);
+    void _MoneyChangedGuarded(GuardedVendorNotification const* notification);
+    bool _VendorQuestRequirementsMet(uint32 questId) const;
+    void _ReconcileVendorQuestCredit(uint32 questId);
+    void _CompleteQuestGuarded(uint32 questId, bool natural);
+    void _SetQuestStatusGuarded(uint32 questId, QuestStatus status, bool update, bool natural);
+    void _RewardQuestGuarded(Quest const* quest, uint32 reward, Object* questGiver, bool announce, bool isLFGReward, bool natural);
+    bool _GuardedVendorCurrent(GuardedVendorRequest const& request);
+    std::string _GuardedVendorInventoryWitness() const;
+    bool _StoreGuardedVendorItem(GuardedVendorRequest const& request, GuardedVendorResult& result);
     Item* _LoadItem(CharacterDatabaseTransaction trans, uint32 zoneId, uint32 timeDiff, Field* fields);
 
     CinematicMgr _cinematicMgr;

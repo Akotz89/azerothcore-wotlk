@@ -1130,6 +1130,7 @@ void Battleground::RemovePlayerAtLeave(Player* player)
     player->ResetAchievementCriteria(ACHIEVEMENT_CRITERIA_CONDITION_BG_MAP, GetMapId(), true);
 
     sScriptMgr->OnBattlegroundRemovePlayerAtLeave(this, player);
+    sScriptMgr->OnPlayerRemoveFromBattleground(player, this);
 }
 
 // this method is called when creating bg
@@ -1241,6 +1242,7 @@ void Battleground::AddPlayer(Player* player)
     AddOrSetPlayerToCorrectBgGroup(player, teamId);
 
     sScriptMgr->OnBattlegroundAddPlayer(this, player);
+    sScriptMgr->OnPlayerAddToBattleground(player, this);
 
     // Log
     LOG_DEBUG("bg.battleground", "BATTLEGROUND: Player {} joined the battle.", player->GetName());

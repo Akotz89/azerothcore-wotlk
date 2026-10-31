@@ -26,6 +26,7 @@
 #include "Battlefield.h"
 #include "BattlefieldMgr.h"
 #include "BattlefieldWG.h"
+#include "Bag.h"
 #include "Battleground.h"
 #include "BattlegroundAV.h"
 #include "BattlegroundMgr.h"
@@ -102,6 +103,7 @@
 //  there is probably some underlying problem with imports which should properly addressed
 //  see: https://github.com/azerothcore/azerothcore-wotlk/issues/9766
 #include "GridNotifiersImpl.h"
+#include "LootReceipt.h"
 
 enum CharacterFlags
 {
@@ -2428,20 +2430,30 @@ void Player::GiveXP(uint32 xp, Unit* victim, float group_rate, bool isLFGReward)
     // Favored experience increase END
 
     // XP to money conversion processed in Player::RewardQuest
-    uint32 const realmMaxLevel = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
-    uint32 maxLevel = realmMaxLevel;
+    uint32 maxLevel = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
 
     // Trial account level cap (0 disables the cap)
     if (uint32 trialLevelCap = sWorld->getIntConfig(CONFIG_TRIAL_LEVEL_CAP))
         if (GetSession()->IsTrialAccount())
             maxLevel = std::min(maxLevel, trialLevelCap);
 
+    uint8 progressionLevelCeiling = uint8(std::min(maxLevel, uint32(MAX_LEVEL)));
+    sScriptMgr->OnPlayerGetProgressionLevelCeiling(this, progressionLevelCeiling);
+    maxLevel = std::min(maxLevel, uint32(progressionLevelCeiling));
+
+    if (!sScriptMgr->OnPlayerCanProgress(this))
+    {
+        if (level >= maxLevel && GetUInt32Value(PLAYER_XP) != 0)
+            SetUInt32Value(PLAYER_XP, 0);
+        return;
+    }
+
     if (level >= maxLevel)
     {
-        // A dynamic realm cap is a hard frontier, not a place to accumulate
-        // progress toward the next phase.  Clear any stale value loaded from
-        // the database as well as rejecting the new award.
-        if (level >= realmMaxLevel && GetUInt32Value(PLAYER_XP) != 0)
+        // A phase cap is a hard frontier, not a place to accumulate progress
+        // toward the next phase. Clear stale persisted XP at the effective cap,
+        // including trial-account caps below the realm maximum.
+        if (GetUInt32Value(PLAYER_XP) != 0)
             SetUInt32Value(PLAYER_XP, 0);
         return;
     }
@@ -2477,7 +2489,7 @@ void Player::GiveXP(uint32 xp, Unit* victim, float group_rate, bool isLFGReward)
             GiveLevel(level + 1);
 
         level = GetLevel();
-        if (level >= realmMaxLevel)
+        if (level >= maxLevel)
         {
             newXP = 0;
             break;
@@ -2495,6 +2507,16 @@ void Player::GiveLevel(uint8 level)
 {
     uint8 oldLevel = GetLevel();
     if (level == oldLevel)
+        return;
+
+    uint32 configuredLevelCeiling = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
+    if (uint32 trialLevelCap = sWorld->getIntConfig(CONFIG_TRIAL_LEVEL_CAP))
+        if (GetSession()->IsTrialAccount())
+            configuredLevelCeiling = std::min(configuredLevelCeiling, trialLevelCap);
+
+    uint8 progressionLevelCeiling = uint8(std::min<uint32>(configuredLevelCeiling, MAX_LEVEL));
+    sScriptMgr->OnPlayerGetProgressionLevelCeiling(this, progressionLevelCeiling);
+    if (level > progressionLevelCeiling || !sScriptMgr->OnPlayerCanProgress(this))
         return;
 
     if (!sScriptMgr->OnPlayerCanGiveLevel(this, level))
@@ -2607,6 +2629,8 @@ bool Player::IsMaxLevel() const
 void Player::InitTalentForLevel()
 {
     uint32 talentPointsForLevel = CalculateTalentsPoints();
+    uint8 level = GetLevel();
+    sScriptMgr->OnPlayerBeforeInitTalentForLevel(this, level, talentPointsForLevel);
 
     // if used more than have then reset
     if (m_usedTalentCount > talentPointsForLevel)
@@ -3425,6 +3449,9 @@ bool Player::IsNeedCastPassiveSpellAtLearn(SpellInfo const* spellInfo) const
 
 void Player::learnSpell(uint32 spellId, bool temporary /*= false*/, bool learnFromSkill /*= false*/)
 {
+    if (!temporary && !isBeingLoaded() && !sScriptMgr->OnPlayerCanLearnProgressionSpell(this, spellId))
+        return;
+
     // Xinef: don't allow to learn active spell once more
     if (HasActiveSpell(spellId))
     {
@@ -5101,9 +5128,9 @@ void Player::CleanupChannels()
 }
 
 // Playerbot helper if bot talks in a different locale
-bool Player::IsInChannel(Channel const* c)
+bool Player::IsInChannel(const Channel* c)
 {
-    return std::any_of(m_channels.begin(), m_channels.end(), [c](Channel const* chan)
+    return std::any_of(m_channels.begin(), m_channels.end(), [c](const Channel* chan)
     {
         return c->GetChannelId() == chan->GetChannelId();
     });
@@ -5508,6 +5535,9 @@ void Player::ModifySkillBonus(uint32 skillid, int32 val, bool talent)
 // To "remove" a skill line, set it's values to zero
 void Player::SetSkill(uint16 id, uint16 step, uint16 newVal, uint16 maxVal)
 {
+    if (!sScriptMgr->OnPlayerCanSetProgressionSkill(this, id, newVal, maxVal, step))
+        return;
+
     if (!id)
         return;
 
@@ -7205,8 +7235,9 @@ void Player::CastAllObtainSpells()
     }
 }
 
-void Player::ApplyItemObtainSpells(Item* item, bool apply)
+void Player::ApplyItemObtainSpells(Item* item, bool apply, std::function<Player*()> const* lifetime)
 {
+    ObjectGuid const guid = item->GetGUID();
     ItemTemplate const* itemTemplate = item->GetTemplate();
     for (uint8 i = 0; i < MAX_ITEM_PROTO_SPELLS; ++i)
     {
@@ -7224,6 +7255,8 @@ void Player::ApplyItemObtainSpells(Item* item, bool apply)
         }
         else
             RemoveAurasDueToSpell(spellId);
+        if (lifetime && ((*lifetime)() != this || GetItemByGuid(guid) != item || item->GetTemplate() != itemTemplate))
+            return;
     }
 }
 
@@ -7598,8 +7631,25 @@ void Player::CastItemCombatSpell(Unit* target, WeaponAttackType attType, uint32 
 
 void Player::CastItemUseSpell(Item* item, SpellCastTargets const& targets, uint8 cast_count, uint32 glyphIndex)
 {
+    if (!item || !GetSession()) return;
+    ObjectGuid const itemGuid = item->GetGUID(), playerGuid = GetGUID();
+    uint8 const bag = item->GetBagSlot(), slot = item->GetSlot();
+    uint64 const session = GetSession()->GetPartySessionIncarnation();
+    SpellCastTargets currentTargets = targets;
+    auto refreshItem = [&]()
+    {
+        if (ObjectAccessor::FindPlayer(playerGuid) != this || !GetSession() || GetSession()->isLogingOut() ||
+            GetSession()->GetPartySessionIncarnation() != session || !IsInWorld()) return false;
+        Item* current = GetUseableItemByPos(bag, slot);
+        if (!current || current->GetGUID() != itemGuid || current->GetOwnerGUID() != playerGuid || current->IsInTrade())
+            return false;
+        item = current;
+        currentTargets.Update(this);
+        return true;
+    };
     if (!sScriptMgr->OnPlayerCanCastItemUseSpell(this, item, targets, cast_count, glyphIndex))
         return;
+    if (!refreshItem() || !GetSession()->IsNativeMutationAuthorized()) return;
 
     ItemTemplate const* proto = item->GetTemplate();
     // special learning case
@@ -7620,7 +7670,7 @@ void Player::CastItemUseSpell(Item* item, SpellCastTargets const& targets, uint8
         spell->m_CastItem = item;
         spell->m_cast_count = cast_count;                   //set count of casts
         spell->SetSpellValue(SPELLVALUE_BASE_POINT0, learning_spell_id);
-        spell->prepare(&targets);
+        spell->prepare(&currentTargets);
         return;
     }
 
@@ -7661,12 +7711,20 @@ void Player::CastItemUseSpell(Item* item, SpellCastTargets const& targets, uint8
         spell->m_CastItem = item;
         spell->m_cast_count = cast_count;                   // set count of casts
         spell->m_glyphIndex = glyphIndex;                   // glyph index
-        spell->InitExplicitTargets(targets);
+        spell->InitExplicitTargets(currentTargets);
 
         // Xinef: dont allow to cast such spells, it may happen that spell possess 2 spells, one for players and one for items / gameobjects
         // Xinef: if first one is cast on player, it may be deleted thus resulting in crash because second spell has saved pointer to the item
         // Xinef: there is one problem with scripts which wont be loaded at the moment of call
         SpellCastResult result = spell->CheckCast(true);
+        if (!refreshItem() || !GetSession()->IsNativeMutationAuthorized())
+        {
+            delete spell;
+            for (Spell* pending : pushSpells) delete pending;
+            return;
+        }
+        spell->m_CastItem = item;
+        spell->m_targets.Update(this);
         if (result != SPELL_CAST_OK)
         {
             spell->SendCastResult(result);
@@ -7675,7 +7733,7 @@ void Player::CastItemUseSpell(Item* item, SpellCastTargets const& targets, uint8
         }
 
         pushSpells.push_back(spell);
-        //spell->prepare(&targets);
+        //spell->prepare(&currentTargets);
 
         ++count;
     }
@@ -7710,12 +7768,20 @@ void Player::CastItemUseSpell(Item* item, SpellCastTargets const& targets, uint8
             spell->m_CastItem = item;
             spell->m_cast_count = cast_count;               // set count of casts
             spell->m_glyphIndex = glyphIndex;               // glyph index
-            spell->InitExplicitTargets(targets);
+            spell->InitExplicitTargets(currentTargets);
 
             // Xinef: dont allow to cast such spells, it may happen that spell possess 2 spells, one for players and one for items / gameobjects
             // Xinef: if first one is cast on player, it may be deleted thus resulting in crash because second spell has saved pointer to the item
             // Xinef: there is one problem with scripts which wont be loaded at the moment of call
             SpellCastResult result = spell->CheckCast(true);
+            if (!refreshItem() || !GetSession()->IsNativeMutationAuthorized())
+            {
+                delete spell;
+                for (Spell* pending : pushSpells) delete pending;
+                return;
+            }
+            spell->m_CastItem = item;
+            spell->m_targets.Update(this);
             if (result != SPELL_CAST_OK)
             {
                 spell->SendCastResult(result);
@@ -7724,15 +7790,27 @@ void Player::CastItemUseSpell(Item* item, SpellCastTargets const& targets, uint8
             }
 
             pushSpells.push_back(spell);
-            //spell->prepare(&targets);
+            //spell->prepare(&currentTargets);
 
             ++count;
         }
     }
 
     // xinef: send all spells in one go, prevents crash because container is not set
-    for (std::list<Spell*>::const_iterator itr = pushSpells.begin(); itr != pushSpells.end(); ++itr)
-        (*itr)->prepare(&targets);
+    while (!pushSpells.empty())
+    {
+        Spell* pending = pushSpells.front();
+        pushSpells.pop_front();
+        if (!refreshItem())
+        {
+            delete pending;
+            for (Spell* remaining : pushSpells) delete remaining;
+            return;
+        }
+        pending->m_CastItem = item;
+        pending->m_targets.Update(this);
+        pending->prepare(&currentTargets);
+    }
 }
 
 void Player::_RemoveAllItemMods()
@@ -10902,10 +10980,97 @@ inline bool Player::_StoreOrEquipNewItem(uint32 vendorslot, uint32 item, uint8 c
     return true;
 }
 
+// Opt-in exact purchase; the legacy bool below remains a stock-window refresh signal.
+Player::GuardedVendorResult Player::BuyItemFromVendorGuarded(GuardedVendorRequest const& original)
+{
+    GuardedVendorRequest request = original;
+    GuardedVendorResult result;
+    Player* actor = request.locate ? request.locate() : nullptr;
+    if (!actor || !request.current || !actor->_GuardedVendorCurrent(request))
+    {
+        result.reason = "stale_request";
+        return result;
+    }
+    result.moneyBefore = result.moneyAfter = actor->GetMoney();
+    result.itemBefore = result.itemAfter = actor->GetItemCount(request.item, false);
+    result.price = request.price;
+    result.observedMoneyAfter = result.moneyBefore;
+    result.observedItemAfter = result.itemBefore;
+    result.observationValid = true;
+    if (request.price > request.money) { result.reason = "insufficient_money"; return result; }
+    request.inventoryWitness = actor->_GuardedVendorInventoryWitness();
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        if (!actor->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+        { request.destination = (INVENTORY_SLOT_BAG_0 << 8) | slot; break; }
+    if (!request.destination) { result.reason = "no_empty_backpack_placement"; return result; }
+    if (result.itemBefore) { result.reason = "already_owned"; return result; }
+    actor->BuyItemFromVendorSlot(request.vendorGuid, request.vendorSlot, request.item, 1,
+        INVENTORY_SLOT_BAG_0, NULL_SLOT, &request, &result);
+    if (result.status == "refused_before_effect")
+        if (Player* live = request.locate())
+        {
+            // Independent script effects are observations, never rolled back as this purchase.
+            result.observedMoneyAfter = live->GetMoney();
+            result.observedItemAfter = live->GetItemCount(request.item, false);
+        }
+        else
+        {
+            result.observationValid = false;
+        }
+    return result;
+}
+
+std::string Player::_GuardedVendorInventoryWitness() const
+{
+    std::string witness;
+    auto append = [&](uint16 position, Item* item)
+    {
+        if (item) witness += std::to_string(position) + ":" + item->GetGUID().ToString() + ":" +
+            std::to_string(item->GetEntry()) + ":" + std::to_string(item->GetCount()) + ";";
+    };
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        append((INVENTORY_SLOT_BAG_0 << 8) | slot, GetItemByPos(INVENTORY_SLOT_BAG_0, slot));
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+        if (Bag* container = GetBagByPos(bag))
+            for (uint8 slot = 0; slot < container->GetBagSize(); ++slot)
+                append((bag << 8) | slot, GetItemByPos(bag, slot));
+    return witness;
+}
+
+bool Player::_GuardedVendorCurrent(GuardedVendorRequest const& request)
+{
+    if (!request.locate || request.locate() != this || !request.current || !request.current()) return false;
+    if (!IsAlive() || !GetSession() || GetSession()->GetCurrentVendor() || GetMoney() != request.money ||
+        GetItemCount(request.item, false) || (request.destination &&
+            _GuardedVendorInventoryWitness() != request.inventoryWitness)) return false;
+    Creature* vendor = GetNPCIfCanInteractWith(request.vendorGuid, UNIT_NPC_FLAG_VENDOR);
+    if (!vendor || vendor->GetEntry() != request.vendorEntry) return false;
+    VendorItemData const* list = vendor->GetVendorItems();
+    VendorItem const* offer = list && request.vendorSlot < list->GetItemCount() ? list->GetItem(request.vendorSlot) : nullptr;
+    ItemTemplate const* proto = sObjectMgr->GetItemTemplate(request.item);
+    if (reinterpret_cast<uintptr_t>(list) != request.vendorListToken ||
+        reinterpret_cast<uintptr_t>(proto) != request.itemTemplateToken ||
+        !offer || !proto || offer->maxcount != request.maxCount || offer->incrtime != request.incrTime || offer->item != request.item || offer->ExtendedCost || proto->BuyCount != 1 ||
+        proto->GetMaxStackSize() != 1 || proto->RandomProperty || proto->RandomSuffix ||
+        (proto->RequiredReputationFaction && uint32(GetReputationRank(proto->RequiredReputationFaction)) < proto->RequiredReputationRank) ||
+        !proto->BuyPrice || proto->BuyPrice > MAX_MONEY_AMOUNT ||
+        uint32(std::floor(proto->BuyPrice * GetReputationPriceDiscount(vendor))) != request.price ||
+        vendor->GetVendorItemCurrentCount(offer) != request.stock ||
+        (offer->maxcount && !request.stock)) return false;
+    ConditionList conditions = sConditionMgr->GetConditionsForNpcVendorEvent(vendor->GetEntry(), request.item);
+    // Native condition evaluation has no script dispatch in this pinned core.
+    return sConditionMgr->IsObjectMeetToConditions(this, vendor, conditions);
+}
+
 // Return true is the bought item has a max count to force refresh of window by caller
-bool Player::BuyItemFromVendorSlot(ObjectGuid vendorguid, uint32 vendorslot, uint32 item, uint8 count, uint8 bag, uint8 slot)
+bool Player::BuyItemFromVendorSlot(ObjectGuid vendorguid, uint32 vendorslot, uint32 item, uint8 count, uint8 bag, uint8 slot, GuardedVendorRequest const* guarded, GuardedVendorResult* receipt)
 {
     sScriptMgr->OnPlayerBeforeBuyItemFromVendor(this, vendorguid, vendorslot, item, count, bag, slot);
+    if (guarded && (guarded->locate() != this || item != guarded->item || !_GuardedVendorCurrent(*guarded)))
+    {
+        receipt->reason = "before_buy_drift";
+        return false;
+    }
 
     // this check can be used from the hook to implement a custom vendor process
     if (item == 0)
@@ -11053,6 +11218,16 @@ bool Player::BuyItemFromVendorSlot(ObjectGuid vendorguid, uint32 vendorslot, uin
             SendBuyError(BUY_ERR_NOT_ENOUGHT_MONEY, creature, item, 0);
             return false;
         }
+    }
+
+    if (guarded)
+    {
+        if (price != guarded->price || !_GuardedVendorCurrent(*guarded))
+        {
+            receipt->reason = "offer_drift";
+            return false;
+        }
+        return _StoreGuardedVendorItem(*guarded, *receipt);
     }
 
     if ((bag == NULL_BAG && slot == NULL_SLOT) || IsInventoryPos(bag, slot))
@@ -11710,13 +11885,13 @@ bool Player::ModifyMoney(int32 amount, bool sendError /*= true*/)
     sScriptMgr->OnPlayerMoneyChanged(this, amount);
 
     if (amount < 0)
-        SetMoney (GetMoney() > uint32(-amount) ? GetMoney() + amount : 0);
+        SetMoney (GetMoney() > uint32(-int64(amount)) ? GetMoney() + amount : 0);
     else
     {
         // Trial account money cap (0 disables the cap)
         if (uint32 trialMoneyCap = sWorld->getIntConfig(CONFIG_TRIAL_MONEY_CAP))
         {
-            if (GetSession()->IsTrialAccount() && GetMoney() + uint32(amount) > trialMoneyCap)
+            if (GetSession()->IsTrialAccount() && uint64(GetMoney()) + uint32(amount) > trialMoneyCap)
             {
                 if (sendError)
                     SendEquipError(EQUIP_ERR_TOO_MUCH_GOLD, nullptr, nullptr);
@@ -11724,7 +11899,7 @@ bool Player::ModifyMoney(int32 amount, bool sendError /*= true*/)
             }
         }
 
-        if (GetMoney() < uint32(MAX_MONEY_AMOUNT - amount))
+        if (uint64(GetMoney()) + uint32(amount) < uint64(MAX_MONEY_AMOUNT))
             SetMoney(GetMoney() + amount);
         else
         {
@@ -13821,14 +13996,26 @@ bool Player::IsBaseRuneSlotsOnCooldown(RuneType runeType) const
 
 void Player::AutoStoreLoot(uint8 bag, uint8 slot, uint32 loot_id, LootStore const& store, bool broadcast)
 {
+    auto const link = LootReceipt::Disenchant::Claim(LootReceipt::Disenchant::Call::AutoStore, &store, GetGUID().GetRawValue(), loot_id);
+    uint64 const batchOp = link.parent ? LootReceipt::Next() : 0;
+    if (batchOp)
+        LootReceipt::Emit("loot_v2 autostore_begin op={} parent={} generation={} corpse={} actor={} loot_id={}",
+            batchOp, link.parent, link.generation, link.corpse, link.actor, loot_id);
     Loot loot;
+    LootReceipt::Disenchant::GeneratedScope generated(&loot, {batchOp, link.generation, link.corpse, link.actor});
     loot.FillLoot (loot_id, store, this, true);
 
     uint32 max_slot = loot.GetMaxSlotInLootFor(this);
     for (uint32 i = 0; i < max_slot; ++i)
     {
-        LootItem* lootItem = loot.LootItemInSlot(i, this);
+        QuestItem* receiptQuest = nullptr;
+        LootItem* lootItem = loot.LootItemInSlot(i, this, &receiptQuest);
 
+        uint64 const outputOp = batchOp ? LootReceipt::Next() : 0;
+        if (outputOp)
+            LootReceipt::Emit("loot_v2 output_begin op={} parent={} route=autostore slot={} entry={} count={} property={} domain={} source_index={}",
+                outputOp, batchOp, i, lootItem->itemid, lootItem->count, lootItem->randomPropertyId,
+                receiptQuest ? "quest" : "normal", receiptQuest ? receiptQuest->index : i);
         ItemPosCountVec dest;
         InventoryResult msg = CanStoreNewItem(bag, slot, dest, lootItem->itemid, lootItem->count);
         if (msg != EQUIP_ERR_OK && slot != NULL_SLOT)
@@ -13838,16 +14025,39 @@ void Player::AutoStoreLoot(uint8 bag, uint8 slot, uint32 loot_id, LootStore cons
         if (msg != EQUIP_ERR_OK)
         {
             SendEquipError(msg, nullptr, nullptr, lootItem->itemid);
+            if (outputOp)
+                LootReceipt::Emit("loot_v2 output_end op={} reason=store_refused error={}", outputOp, uint32(msg));
             continue;
         }
 
+        if (outputOp)
+            LootReceipt::Destinations(outputOp, "before", this, dest);
         Item* pItem = StoreNewItem(dest, lootItem->itemid, true, lootItem->randomPropertyId);
+        if (outputOp)
+            LootReceipt::Destinations(outputOp, "stored", this, dest);
         SendNewItem(pItem, lootItem->count, false, false, broadcast);
+        if (outputOp)
+        {
+            LootReceipt::Destinations(outputOp, "after_send", this, dest);
+            LootReceipt::Emit("loot_v2 output_end op={} reason=native_store_returned error={}", outputOp, uint32(msg));
+        }
     }
+    if (batchOp)
+        LootReceipt::Emit("loot_v2 autostore_end op={} outputs={}", batchOp, max_slot);
 }
 
 LootItem* Player::StoreLootItem(uint8 lootSlot, Loot* loot, InventoryResult& msg)
 {
+    uint64 const receiptOp = LootReceipt::Next();
+    auto const generatedLink = LootReceipt::Disenchant::FromLoot(loot, GetGUID().GetRawValue());
+    if (generatedLink.parent)
+        LootReceipt::Emit("loot_v2 generated_store_link op={} parent={} generation={} corpse={} actor={}",
+            receiptOp, generatedLink.parent, generatedLink.generation, generatedLink.corpse, generatedLink.actor);
+    LootReceipt::Emit("loot_v1 item_begin op={} generation={} route=ordinary corpse={} map={} instance={} actor={} slot={}",
+        receiptOp, loot->receiptGeneration, loot->sourceWorldObjectGUID.GetRawValue(), loot->receiptMapId, loot->receiptInstanceId, GetGUID().GetRawValue(), lootSlot);
+    LootReceipt::Emit("loot_v1 actor_location op={} map={} instance={}", receiptOp, GetMapId(), GetInstanceId());
+    auto receiptEnd = [&](char const* reason) noexcept
+    { LootReceipt::Emit("loot_v1 item_end op={} reason={} error={} unlooted={}", receiptOp, reason, uint32(msg), loot->unlootedCount); };
     QuestItem* qitem = nullptr;
     QuestItem* ffaitem = nullptr;
     QuestItem* conditem = nullptr;
@@ -13861,8 +14071,15 @@ LootItem* Player::StoreLootItem(uint8 lootSlot, Loot* loot, InventoryResult& msg
         {
             SendEquipError(EQUIP_ERR_ALREADY_LOOTED, nullptr, nullptr);
         }
+        receiptEnd("missing_or_consumed");
         return nullptr;
     }
+
+    LootReceipt::ItemState(receiptOp, "resolved", loot, item, this, lootSlot, qitem ? "quest_visible" : "normal_visible");
+    LootReceipt::Emit("loot_v1 slot_mapping op={} source_index={} quest={}", receiptOp, qitem ? qitem->index : lootSlot, bool(qitem));
+    LootReceipt::Emit("loot_v1 entitlement op={} quest={} ffa={} conditional={} quest_used={} ffa_used={} conditional_used={}",
+        receiptOp, bool(qitem), bool(ffaitem), bool(conditem), qitem ? qitem->is_looted : false,
+        ffaitem ? ffaitem->is_looted : false, conditem ? conditem->is_looted : false);
 
     // Xinef: exploit protection, dont allow to loot normal items if player is not master loot and not below loot threshold
     // Xinef: only quest, ffa and conditioned items
@@ -13870,12 +14087,14 @@ LootItem* Player::StoreLootItem(uint8 lootSlot, Loot* loot, InventoryResult& msg
         if (!qitem && !ffaitem && !conditem)
         {
             SendLootRelease(GetLootGUID());
+            receiptEnd("master_ineligible");
             return nullptr;
         }
 
     if (!item->AllowedForPlayer(this, loot->sourceWorldObjectGUID))
     {
         SendLootRelease(GetLootGUID());
+        receiptEnd("not_allowed");
         return nullptr;
     }
 
@@ -13883,6 +14102,7 @@ LootItem* Player::StoreLootItem(uint8 lootSlot, Loot* loot, InventoryResult& msg
     if (!qitem && item->is_blocked)
     {
         SendLootRelease(GetLootGUID());
+        receiptEnd("blocked");
         return nullptr;
     }
 
@@ -13890,6 +14110,7 @@ LootItem* Player::StoreLootItem(uint8 lootSlot, Loot* loot, InventoryResult& msg
     if (item->rollWinnerGUID && item->rollWinnerGUID != GetGUID())
     {
         SendLootRelease(GetLootGUID());
+        receiptEnd("foreign_winner");
         return nullptr;
     }
 
@@ -13898,7 +14119,10 @@ LootItem* Player::StoreLootItem(uint8 lootSlot, Loot* loot, InventoryResult& msg
     if (msg == EQUIP_ERR_OK)
     {
         AllowedLooterSet looters = item->GetAllowedLooters();
+        LootReceipt::Destinations(receiptOp, "before", this, dest);
         Item* newitem = StoreNewItem(dest, item->itemid, true, item->randomPropertyId, looters);
+
+        LootReceipt::Destinations(receiptOp, "stored", this, dest);
 
         if (qitem)
         {
@@ -13939,13 +14163,20 @@ LootItem* Player::StoreLootItem(uint8 lootSlot, Loot* loot, InventoryResult& msg
         if (loot->containerGUID)
             sLootItemStorage->RemoveStoredLootItem(loot->containerGUID, item->itemid, item->count, loot, item->itemIndex);
 
+        LootReceipt::Emit("loot_v1 entitlement_consumed op={} quest={} ffa={} conditional={}", receiptOp,
+            qitem ? qitem->is_looted : false, ffaitem ? ffaitem->is_looted : false, conditem ? conditem->is_looted : false);
+        LootReceipt::ItemState(receiptOp, "consumed", loot, item, this, lootSlot, qitem ? "quest_visible" : "normal_visible");
+        LootReceipt::ItemContext receiptContext(receiptOp, loot->receiptGeneration, loot->sourceWorldObjectGUID.GetRawValue());
         sScriptMgr->OnPlayerLootItem(this, newitem, item->count, this->GetLootGUID());
+        LootReceipt::Destinations(receiptOp, "after_hooks", this, dest);
+        LootReceipt::ItemState(receiptOp, "terminal", loot, item, this, lootSlot, qitem ? "quest_visible" : "normal_visible");
     }
     else
     {
         SendEquipError(msg, nullptr, nullptr, item->itemid);
     }
 
+    receiptEnd(msg == EQUIP_ERR_OK ? "native_consumed" : "store_refused");
     return item;
 }
 

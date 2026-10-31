@@ -16,6 +16,11 @@
  */
 
 #include "AllItemScript.h"
+#include "ObjectAccessor.h"
+#include "Player.h"
+#include "Item.h"
+#include "WorldSession.h"
+#include "Spell.h"
 #include "ItemScript.h"
 #include "ScriptMgr.h"
 #include "ScriptMgrMacros.h"
@@ -27,9 +32,23 @@ bool ScriptMgr::OnQuestAccept(Player* player, Item* item, Quest const* quest)
     ASSERT(item);
     ASSERT(quest);
 
+    ObjectGuid const playerGuid = player->GetGUID(), itemGuid = item->GetGUID();
+    uint64 const session = player->GetSession() ? player->GetSession()->GetPartySessionIncarnation() : 0;
+    uint8 const bag = item->GetBagSlot(), slot = item->GetSlot();
+    auto refresh = [&]()
+    {
+        if (ObjectAccessor::FindPlayer(playerGuid) != player || !player->GetSession() ||
+            player->GetSession()->GetPartySessionIncarnation() != session || player->GetSession()->isLogingOut()) return false;
+        Item* current = player->GetItemByGuid(itemGuid);
+        if (!current || current->GetOwnerGUID() != playerGuid || current->GetBagSlot() != bag || current->GetSlot() != slot) return false;
+        item = current;
+        return true;
+    };
     auto ret = IsValidBoolScript<AllItemScript>([&](AllItemScript* script)
     {
-        return !script->CanItemQuestAccept(player, item, quest);
+        if (!refresh()) return true;
+        bool const veto = !script->CanItemQuestAccept(player, item, quest);
+        return !refresh() || veto;
     });
 
     if (ret && *ret)
@@ -37,6 +56,16 @@ bool ScriptMgr::OnQuestAccept(Player* player, Item* item, Quest const* quest)
         return false;
     }
 
+    auto handled = IsValidBoolScript<AllItemScript>([&](AllItemScript* script)
+    {
+        if (!refresh()) return true;
+        bool const handled = script->OnItemQuestAccept(player, item, quest);
+        return !refresh() || handled;
+    });
+    if (handled && *handled)
+        return true;
+
+    if (!refresh()) return true;
     auto tempScript = ScriptRegistry<ItemScript>::GetScriptById(item->GetScriptId());
     ClearGossipMenuFor(player);
     return tempScript ? tempScript->OnQuestAccept(player, item, quest) : false;
@@ -47,9 +76,27 @@ bool ScriptMgr::OnItemUse(Player* player, Item* item, SpellCastTargets const& ta
     ASSERT(player);
     ASSERT(item);
 
+    ObjectGuid const playerGuid = player->GetGUID(), itemGuid = item->GetGUID();
+    if (!player->GetSession()) return true;
+    uint64 const session = player->GetSession()->GetPartySessionIncarnation();
+    uint8 const bag = item->GetBagSlot(), slot = item->GetSlot();
+    SpellCastTargets currentTargets = targets;
+    auto refreshItem = [&]()
+    {
+        if (ObjectAccessor::FindPlayer(playerGuid) != player || !player->IsInWorld() || !player->GetSession() ||
+            player->GetSession()->isLogingOut() || player->GetSession()->GetPartySessionIncarnation() != session) return false;
+        Item* current = player->GetUseableItemByPos(bag, slot);
+        if (!current || current->GetGUID() != itemGuid || current->GetOwnerGUID() != playerGuid || current->IsInTrade())
+            return false;
+        item = current;
+        currentTargets.Update(player);
+        return true;
+    };
     auto ret = IsValidBoolScript<AllItemScript>([&](AllItemScript* script)
     {
-        return script->CanItemUse(player, item, targets);
+        if (!refreshItem()) return true;
+        bool handled = script->CanItemUse(player, item, currentTargets);
+        return handled || !refreshItem();
     });
 
     if (ret && *ret)
@@ -57,8 +104,9 @@ bool ScriptMgr::OnItemUse(Player* player, Item* item, SpellCastTargets const& ta
         return true;
     }
 
+    if (!refreshItem()) return true;
     auto tempScript = ScriptRegistry<ItemScript>::GetScriptById(item->GetScriptId());
-    return tempScript ? tempScript->OnUse(player, item, targets) : false;
+    return tempScript ? tempScript->OnUse(player, item, currentTargets) : false;
 }
 
 bool ScriptMgr::OnItemExpire(Player* player, ItemTemplate const* proto)
@@ -75,6 +123,13 @@ bool ScriptMgr::OnItemExpire(Player* player, ItemTemplate const* proto)
     {
         return false;
     }
+
+    auto handled = IsValidBoolScript<AllItemScript>([&](AllItemScript* script)
+    {
+        return script->OnItemExpire(player, proto);
+    });
+    if (handled && *handled)
+        return true;
 
     auto tempScript = ScriptRegistry<ItemScript>::GetScriptById(proto->ScriptId);
     return tempScript ? tempScript->OnExpire(player, proto) : false;
@@ -95,6 +150,13 @@ bool ScriptMgr::OnItemRemove(Player* player, Item* item)
         return false;
     }
 
+    auto handled = IsValidBoolScript<AllItemScript>([&](AllItemScript* script)
+    {
+        return script->OnItemRemove(player, item);
+    });
+    if (handled && *handled)
+        return true;
+
     auto tempScript = ScriptRegistry<ItemScript>::GetScriptById(item->GetScriptId());
     return tempScript ? tempScript->OnRemove(player, item) : false;
 }
@@ -105,6 +167,13 @@ bool ScriptMgr::OnCastItemCombatSpell(Player* player, Unit* victim, SpellInfo co
     ASSERT(victim);
     ASSERT(spellInfo);
     ASSERT(item);
+
+    auto denied = IsValidBoolScript<AllItemScript>([&](AllItemScript* script)
+    {
+        return !script->CanItemCastCombatSpell(player, victim, spellInfo, item);
+    });
+    if (denied && *denied)
+        return false;
 
     auto tempScript = ScriptRegistry<ItemScript>::GetScriptById(item->GetScriptId());
     return tempScript ? tempScript->OnCastItemCombatSpell(player, victim, spellInfo, item) : true;

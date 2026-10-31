@@ -23,6 +23,7 @@
 #include "Language.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
+#include "Item.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
 #include "Player.h"
@@ -121,6 +122,26 @@ void WorldSession::HandleQuestgiverAcceptQuestOpcode(WorldPacket& recvData)
 
     Object* object = ObjectAccessor::GetObjectByTypeMask(*_player, guid, TYPEMASK_UNIT | TYPEMASK_GAMEOBJECT | TYPEMASK_ITEM | TYPEMASK_PLAYER);
 
+    ObjectGuid const playerGuid = _player->GetGUID();
+    uint64 const session = GetPartySessionIncarnation();
+    bool const itemGiver = object && (object->GetTypeId() == TYPEID_ITEM || object->GetTypeId() == TYPEID_CONTAINER);
+    uint8 const originalBag = itemGiver ? static_cast<Item*>(object)->GetBagSlot() : uint8(NULL_BAG);
+    uint8 const originalSlot = itemGiver ? static_cast<Item*>(object)->GetSlot() : uint8(NULL_SLOT);
+    auto refreshQuestGiver = [&]()
+    {
+        if (!_player || ObjectAccessor::FindPlayer(playerGuid) != _player || _player->GetSession() != this ||
+            GetPartySessionIncarnation() != session || isLogingOut() || !IsNativeMutationAuthorized()) return false;
+        Object* current = ObjectAccessor::GetObjectByTypeMask(*_player, guid, TYPEMASK_UNIT | TYPEMASK_GAMEOBJECT | TYPEMASK_ITEM | TYPEMASK_PLAYER);
+        if (!current || current != object) return false;
+        if (itemGiver)
+        {
+            Item* item = static_cast<Item*>(current);
+            if (item->GetOwnerGUID() != playerGuid || item->GetBagSlot() != originalBag || item->GetSlot() != originalSlot) return false;
+        }
+        object = current;
+        return true;
+    };
+
     // no or incorrect quest giver
     if (!object || object == _player || (!object->IsPlayer() && !object->hasQuest(questId)) ||
             (object->IsPlayer() && !object->ToPlayer()->CanShareQuest(questId)))
@@ -144,7 +165,9 @@ void WorldSession::HandleQuestgiverAcceptQuestOpcode(WorldPacket& recvData)
                         return;
 
         // prevent cheating
-        if (!GetPlayer()->CanTakeQuest(quest, true))
+        bool const canTake = GetPlayer()->CanTakeQuest(quest, true);
+        if (!refreshQuestGiver()) return;
+        if (!canTake)
         {
             _player->PlayerTalkClass->SendCloseGossip();
             _player->SetDivider();
@@ -161,9 +184,13 @@ void WorldSession::HandleQuestgiverAcceptQuestOpcode(WorldPacket& recvData)
             }
         }
 
-        if (_player->CanAddQuest(quest, true))
+        bool const canAdd = _player->CanAddQuest(quest, true);
+        if (!refreshQuestGiver()) return;
+        if (canAdd)
         {
             _player->AddQuestAndCheckCompletion(quest, object);
+            // Native quest acceptance may consume its item; only refresh the player after admission.
+            if (!_player || ObjectAccessor::FindPlayer(playerGuid) != _player || _player->GetSession() != this || isLogingOut()) return;
 
             if (quest->HasFlag(QUEST_FLAGS_PARTY_ACCEPT))
             {
@@ -222,6 +249,10 @@ void WorldSession::HandleQuestgiverQueryQuestOpcode(WorldPacket& recvData)
         // if this breaks them, add && object->IsItem() to this check
         // item-started quests never have that flag
         if (!_player->CanTakeQuest(quest, true))
+            return;
+
+        if (object->GetTypeId() == TYPEID_UNIT &&
+            sScriptMgr->OnQuestSelect(_player, object->ToCreature(), quest))
             return;
 
         if (quest->IsAutoAccept() && _player->CanAddQuest(quest, true))
@@ -500,6 +531,10 @@ void WorldSession::HandleQuestgiverCompleteQuest(WorldPacket& recvData)
                            _player->GetName(), _player->GetGUID().ToString(), questId);
             return;
         }
+
+        if (object->GetTypeId() == TYPEID_UNIT &&
+            sScriptMgr->OnQuestComplete(_player, object->ToCreature(), quest))
+            return;
 
         if (Battleground* bg = _player->GetBattleground())
             if (bg->GetBgTypeID(true) == BATTLEGROUND_AV)

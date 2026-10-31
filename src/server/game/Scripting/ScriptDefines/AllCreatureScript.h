@@ -26,6 +26,11 @@ protected:
     AllCreatureScript(char const* name);
 
 public:
+    // Global handled-result seams preserve the database-bound fallback when false.
+    [[nodiscard]] virtual bool OnCreatureQuestSelect(Player* /*player*/, Creature* /*creature*/, Quest const* /*quest*/) { return false; }
+    [[nodiscard]] virtual bool OnCreatureQuestComplete(Player* /*player*/, Creature* /*creature*/, Quest const* /*quest*/) { return false; }
+    [[nodiscard]] virtual bool OnCreatureQuestReward(Player* /*player*/, Creature* /*creature*/, Quest const* /*quest*/, uint32 /*opt*/) { return false; }
+
     // Called from End of Creature Update.
     virtual void OnAllCreatureUpdate(Creature* /*creature*/, uint32 /*diff*/) { }
 

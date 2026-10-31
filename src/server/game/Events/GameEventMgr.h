@@ -107,6 +107,34 @@ public:
     typedef std::vector<GameEventData> GameEventDataMap;
     [[nodiscard]] ActiveEvents const& GetActiveEventList() const { return _activeEvents; }
     [[nodiscard]] GameEventDataMap const& GetEventMap() const { return _gameEvent; }
+    // Passive world-thread acquisition source observation; values only, no eligibility/script calls.
+    [[nodiscard]] bool QuestSourceRegistryReady() const { return _isSystemInit; }
+    [[nodiscard]] std::map<uint32, std::vector<std::pair<int32, uint32>>> CopyQuestEventRelations() const
+    {
+        std::map<uint32, std::vector<std::pair<int32, uint32>>> result;
+        for (uint32 event = 0; event < _gameEventCreatureQuests.size(); ++event)
+            for (auto const& row : _gameEventCreatureQuests[event]) result[row.second].emplace_back(int32(row.first), event);
+        for (uint32 event = 0; event < _gameEventGameObjectQuests.size(); ++event)
+            for (auto const& row : _gameEventGameObjectQuests[event]) result[row.second].emplace_back(-int32(row.first), event);
+        return result;
+    }
+    [[nodiscard]] std::vector<int32> CopyPoolEventIds(uint32 poolId) const
+    {
+        std::vector<int32> result;
+        for (uint32 slot = 0; slot < _gameEventPoolIds.size(); ++slot)
+            for (auto id : _gameEventPoolIds[slot])
+                if (id == poolId) result.push_back(int32(slot) - int32(_gameEvent.size()) + 1);
+        return result;
+    }
+    [[nodiscard]] std::vector<uint32> CopyQuestEventIds(uint32 questId) const
+    {
+        std::vector<uint32> result;
+        auto found = _questToEventConditions.find(questId);
+        if (found != _questToEventConditions.end()) result.push_back(found->second.EventId);
+        for (auto const& row : _gameEventSeasonalQuestsMap)
+            for (auto id : row.second) if (id == questId) result.push_back(row.first);
+        return result;
+    }
     [[nodiscard]] bool CheckOneGameEvent(uint16 entry) const;
     [[nodiscard]] uint32 NextCheck(uint16 entry) const;
     void LoadFromDB();

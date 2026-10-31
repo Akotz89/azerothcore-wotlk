@@ -64,43 +64,52 @@ void MapMgr::Initialize()
 
 void MapMgr::InitializeVisibilityDistanceInfo()
 {
-    for (MapMapType::iterator iter = i_maps.begin(); iter != i_maps.end(); ++iter)
-        (*iter).second->InitVisibilityDistance();
+    for (Map* map : GetBaseMaps())
+        map->InitVisibilityDistance();
 }
 
 Map* MapMgr::CreateBaseMap(uint32 id)
 {
-    Map* map = FindBaseMap(id);
-
-    if (!map)
+    Map* map;
+    std::unique_ptr<Map> candidate;
     {
         std::lock_guard<std::mutex> guard(Lock);
+        auto existing = i_maps.find(id);
+        if (existing != i_maps.end())
+            return existing->second;
 
-        map = FindBaseMap(id);
-        if (!map) // pussywizard: check again after acquiring mutex
+        MapEntry const* entry = sMapStore.LookupEntry(id);
+        ASSERT(entry);
+
+        if (entry->Instanceable())
+            candidate = std::make_unique<MapInstanced>(id);
+        else
+            candidate = std::make_unique<Map>(id, 0, REGULAR_DIFFICULTY);
+
+        if (!entry->Instanceable())
         {
-            MapEntry const* entry = sMapStore.LookupEntry(id);
-            ASSERT(entry);
-
-            if (entry->Instanceable())
-                map = new MapInstanced(id);
-            else
-                map = new Map(id, 0, REGULAR_DIFFICULTY);
-
-            i_maps[id] = map;
-
-            if (!entry->Instanceable())
-            {
-                map->LoadRespawnTimes();
-                map->LoadCorpseData();
-            }
-
-            map->OnCreateMap();
+            candidate->LoadRespawnTimes();
+            candidate->LoadCorpseData();
         }
+
+        map = candidate.get();
+        i_maps.emplace(id, map);
+        candidate.release();
     }
 
-    ASSERT(map);
+    // Scripts may look up or create another map; notify after initialized publication and unlock.
+    map->OnCreateMap();
     return map;
+}
+
+std::vector<Map*> MapMgr::GetBaseMaps() const
+{
+    std::lock_guard<std::mutex> guard(Lock);
+    std::vector<Map*> maps;
+    maps.reserve(i_maps.size());
+    for (auto const& entry : i_maps)
+        maps.push_back(entry.second);
+    return maps;
 }
 
 Map* MapMgr::FindBaseNonInstanceMap(uint32 mapId) const
@@ -266,14 +275,14 @@ void MapMgr::Update(uint32 diff)
         }
     }
 
-    MapMapType::iterator iter = i_maps.begin();
-    for (; iter != i_maps.end(); ++iter)
+    std::vector<Map*> const maps = GetBaseMaps();
+    for (Map* map : maps)
     {
-        bool full = mapUpdateStep < 3 && ((mapUpdateStep == 0 && !iter->second->IsBattlegroundOrArena() && !iter->second->IsDungeon()) || (mapUpdateStep == 1 && iter->second->IsBattlegroundOrArena()) || (mapUpdateStep == 2 && iter->second->IsDungeon()));
+        bool full = mapUpdateStep < 3 && ((mapUpdateStep == 0 && !map->IsBattlegroundOrArena() && !map->IsDungeon()) || (mapUpdateStep == 1 && map->IsBattlegroundOrArena()) || (mapUpdateStep == 2 && map->IsDungeon()));
         if (m_updater.activated())
-            m_updater.schedule_update(*iter->second, uint32(full ? i_timer[mapUpdateStep].GetCurrent() : 0), diff);
+            m_updater.schedule_update(*map, uint32(full ? i_timer[mapUpdateStep].GetCurrent() : 0), diff);
         else
-            iter->second->Update(uint32(full ? i_timer[mapUpdateStep].GetCurrent() : 0), diff);
+            map->Update(uint32(full ? i_timer[mapUpdateStep].GetCurrent() : 0), diff);
     }
 
     if (m_updater.activated())
@@ -281,11 +290,11 @@ void MapMgr::Update(uint32 diff)
 
     if (mapUpdateStep < 3)
     {
-        for (iter = i_maps.begin(); iter != i_maps.end(); ++iter)
+        for (Map* map : maps)
         {
-            bool full = ((mapUpdateStep == 0 && !iter->second->IsBattlegroundOrArena() && !iter->second->IsDungeon()) || (mapUpdateStep == 1 && iter->second->IsBattlegroundOrArena()) || (mapUpdateStep == 2 && iter->second->IsDungeon()));
+            bool full = ((mapUpdateStep == 0 && !map->IsBattlegroundOrArena() && !map->IsDungeon()) || (mapUpdateStep == 1 && map->IsBattlegroundOrArena()) || (mapUpdateStep == 2 && map->IsDungeon()));
             if (full)
-                iter->second->DelayedUpdate(uint32(i_timer[mapUpdateStep].GetCurrent()));
+                map->DelayedUpdate(uint32(i_timer[mapUpdateStep].GetCurrent()));
         }
 
         i_timer[mapUpdateStep].SetCurrent(0);
@@ -327,11 +336,19 @@ bool MapMgr::IsValidMAP(uint32 mapid, bool startUp)
 
 void MapMgr::UnloadAll()
 {
-    for (MapMapType::iterator iter = i_maps.begin(); iter != i_maps.end();)
+    while (true)
     {
-        iter->second->UnloadAll();
-        delete iter->second;
-        i_maps.erase(iter++);
+        Map* map;
+        {
+            std::lock_guard<std::mutex> guard(Lock);
+            if (i_maps.empty())
+                break;
+            auto iter = i_maps.begin();
+            map = iter->second;
+            i_maps.erase(iter);
+        }
+        map->UnloadAll();
+        delete map;
     }
 
     if (m_updater.activated())
@@ -340,9 +357,8 @@ void MapMgr::UnloadAll()
 
 void MapMgr::GetNumInstances(uint32& dungeons, uint32& battlegrounds, uint32& arenas)
 {
-    for (MapMapType::iterator itr = i_maps.begin(); itr != i_maps.end(); ++itr)
+    for (Map* map : GetBaseMaps())
     {
-        Map* map = itr->second;
         if (!map->Instanceable())
             continue;
         MapInstanced::InstancedMaps& maps = ((MapInstanced*)map)->GetInstancedMaps();
@@ -357,9 +373,8 @@ void MapMgr::GetNumInstances(uint32& dungeons, uint32& battlegrounds, uint32& ar
 
 void MapMgr::GetNumPlayersInInstances(uint32& dungeons, uint32& battlegrounds, uint32& arenas, uint32& spectators)
 {
-    for (MapMapType::iterator itr = i_maps.begin(); itr != i_maps.end(); ++itr)
+    for (Map* map : GetBaseMaps())
     {
-        Map* map = itr->second;
         if (!map->Instanceable())
             continue;
         MapInstanced::InstancedMaps& maps = ((MapInstanced*)map)->GetInstancedMaps();
